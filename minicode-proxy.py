@@ -23,6 +23,16 @@ def argument_text(value) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def as_call(obj) -> dict | None:
+    if not isinstance(obj, dict) or not obj.get("name"):
+        return None
+    if "arguments" not in obj and "parameters" not in obj:
+        return None
+    if "arguments" not in obj:
+        obj = {"name": obj.get("name"), "arguments": obj.get("parameters")}
+    return obj
+
+
 def parse_calls(text: str) -> list[dict]:
     found = []
     for raw in TOOL_BLOCK.findall(text or ""):
@@ -30,8 +40,9 @@ def parse_calls(text: str) -> list[dict]:
             obj = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if isinstance(obj, dict) and obj.get("name"):
-            found.append(obj)
+        call = as_call(obj)
+        if call:
+            found.append(call)
     if found:
         return found
     body = (text or "").strip()
@@ -41,12 +52,30 @@ def parse_calls(text: str) -> list[dict]:
     try:
         obj = json.loads(body)
     except json.JSONDecodeError:
-        return []
-    if isinstance(obj, dict) and obj.get("name") and "arguments" in obj:
-        return [obj]
-    if isinstance(obj, list) and obj and all(isinstance(item, dict) and item.get("name") for item in obj):
-        return obj
-    return []
+        obj = None
+    if isinstance(obj, dict):
+        call = as_call(obj)
+        return [call] if call else []
+    if isinstance(obj, list):
+        calls = [call for item in obj if (call := as_call(item))]
+        return calls
+    decoder = json.JSONDecoder()
+    index = 0
+    source = text or ""
+    while True:
+        start = source.find("{", index)
+        if start < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(source, start)
+        except json.JSONDecodeError:
+            index = start + 1
+            continue
+        index = end
+        call = as_call(obj)
+        if call:
+            found.append(call)
+    return found
 
 
 def openai_tool_calls(calls: list[dict]) -> list[dict]:
