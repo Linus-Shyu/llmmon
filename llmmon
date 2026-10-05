@@ -1,0 +1,1208 @@
+#!/usr/bin/env python3
+"""llmmon — live model monitor.
+
+The picture is drawn on the machine where you run the command.
+A headless Mac only samples and sends one small JSON line, five times a second.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import select
+import signal
+import socket
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+import urllib.request
+from ctypes import POINTER, byref, c_int, c_uint, c_uint32, c_uint64, c_void_p
+
+INTERVAL = 0.20
+OLLAMA = "http://127.0.0.1:11434"
+
+CHIPS = {
+    "Mac14,3": "M2",
+    "Mac14,12": "M2 Pro",
+    "Mac15,4": "M3",
+    "Mac15,5": "M3",
+    "Mac16,10": "M4",
+    "Mac16,11": "M4 Pro",
+    "Mac16,15": "M4 Max",
+    "Mac17,2": "M5",
+}
+
+RST = "\033[0m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+AMBER = "\033[38;2;255;176;46m"
+CYAN = "\033[38;2;90;220;205m"
+GREEN = "\033[38;2;120;220;140m"
+RED = "\033[38;2;255;95;90m"
+INK = "\033[38;2;210;214;220m"
+
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def _personal_mark() -> list[str]:
+    path = os.path.expanduser("~/.config/fastfetch/linus_art.txt")
+    try:
+        raw = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return []
+    return [line.rstrip() for line in raw if line.strip()]
+
+
+MARK = _personal_mark()
+libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+
+natural_t = c_uint
+integer_t = c_int
+libc.mach_host_self.restype = c_uint
+libc.mach_task_self.restype = c_uint
+libc.host_processor_info.argtypes = [
+    c_uint,
+    c_int,
+    POINTER(natural_t),
+    POINTER(POINTER(integer_t)),
+    POINTER(natural_t),
+]
+libc.host_processor_info.restype = c_int
+libc.vm_deallocate.argtypes = [c_uint, ctypes.c_ulong, ctypes.c_ulong]
+libc.vm_deallocate.restype = c_int
+libc.sysctlbyname.argtypes = [ctypes.c_char_p, c_void_p, POINTER(ctypes.c_size_t), c_void_p, ctypes.c_size_t]
+libc.sysctlbyname.restype = c_int
+libc.proc_listallpids.argtypes = [c_void_p, c_int]
+libc.proc_listallpids.restype = c_int
+libc.proc_name.argtypes = [c_int, c_void_p, c_uint32]
+libc.proc_name.restype = c_int
+libc.proc_pidinfo.argtypes = [c_int, c_int, c_uint64, c_void_p, c_int]
+libc.proc_pidinfo.restype = c_int
+
+PROCESSOR_CPU_LOAD_INFO = 2
+CPU_STATE_MAX = 4
+HOST_VM_INFO64 = 4
+PROC_PIDTASKINFO = 4
+
+
+class VMStat(ctypes.Structure):
+    _fields_ = [
+        ("free_count", c_uint32),
+        ("active_count", c_uint32),
+        ("inactive_count", c_uint32),
+        ("wire_count", c_uint32),
+        ("zero_fill_count", c_uint64),
+        ("reactivations", c_uint64),
+        ("pageins", c_uint64),
+        ("pageouts", c_uint64),
+        ("faults", c_uint64),
+        ("cow_faults", c_uint64),
+        ("lookups", c_uint64),
+        ("hits", c_uint64),
+        ("purges", c_uint64),
+        ("purgeable_count", c_uint32),
+        ("speculative_count", c_uint32),
+        ("decompressions", c_uint64),
+        ("compressions", c_uint64),
+        ("swapins", c_uint64),
+        ("swapouts", c_uint64),
+        ("compressor_page_count", c_uint32),
+        ("throttled_count", c_uint32),
+        ("external_page_count", c_uint32),
+        ("internal_page_count", c_uint32),
+        ("total_uncompressed_pages_in_compressor", c_uint64),
+        ("_pad", c_uint64 * 8),
+    ]
+
+
+class SwapUsage(ctypes.Structure):
+    _fields_ = [
+        ("total", c_uint64),
+        ("avail", c_uint64),
+        ("used", c_uint64),
+        ("pagesize", c_uint32),
+        ("encrypted", c_int),
+    ]
+
+
+class ProcTaskInfo(ctypes.Structure):
+    _fields_ = [
+        ("virtual_size", c_uint64),
+        ("resident_size", c_uint64),
+        ("total_user", c_uint64),
+        ("total_system", c_uint64),
+        ("threads_user", c_uint64),
+        ("threads_system", c_uint64),
+        ("policy", c_int),
+        ("faults", c_int),
+        ("pageins", c_int),
+        ("cow_faults", c_int),
+        ("messages_sent", c_int),
+        ("messages_received", c_int),
+        ("syscalls_mach", c_int),
+        ("syscalls_unix", c_int),
+        ("csw", c_int),
+        ("threadnum", c_int),
+        ("numrunning", c_int),
+        ("priority", c_int),
+    ]
+
+
+libc.host_statistics64.argtypes = [c_uint, c_int, POINTER(VMStat), POINTER(natural_t)]
+libc.host_statistics64.restype = c_int
+
+
+def sysctl_u64(name: str) -> int | None:
+    val = c_uint64()
+    size = ctypes.c_size_t(ctypes.sizeof(val))
+    if libc.sysctlbyname(name.encode(), byref(val), byref(size), None, 0) != 0:
+        return None
+    return int(val.value)
+
+
+def sysctl_u32(name: str) -> int | None:
+    val = c_uint32()
+    size = ctypes.c_size_t(ctypes.sizeof(val))
+    if libc.sysctlbyname(name.encode(), byref(val), byref(size), None, 0) != 0:
+        return None
+    return int(val.value)
+
+
+def sysctl_str(name: str) -> str:
+    buf = ctypes.create_string_buffer(128)
+    size = ctypes.c_size_t(128)
+    if libc.sysctlbyname(name.encode(), buf, byref(size), None, 0) != 0:
+        return ""
+    return buf.value.decode(errors="replace")
+
+
+def cpu_ticks() -> list[tuple[int, int, int, int]]:
+    count = natural_t()
+    info = POINTER(integer_t)()
+    info_cnt = natural_t()
+    kr = libc.host_processor_info(
+        libc.mach_host_self(),
+        PROCESSOR_CPU_LOAD_INFO,
+        byref(count),
+        byref(info),
+        byref(info_cnt),
+    )
+    if kr != 0:
+        return []
+    n = count.value
+    out = []
+    for i in range(n):
+        base = i * CPU_STATE_MAX
+        out.append(tuple(int(info[base + j]) & 0xFFFFFFFF for j in range(4)))
+    libc.vm_deallocate(
+        libc.mach_task_self(),
+        ctypes.cast(info, c_void_p).value or 0,
+        info_cnt.value * ctypes.sizeof(integer_t),
+    )
+    return out
+
+
+def vm_stat() -> VMStat | None:
+    vm = VMStat()
+    count = natural_t(ctypes.sizeof(VMStat) // 4)
+    kr = libc.host_statistics64(libc.mach_host_self(), HOST_VM_INFO64, byref(vm), byref(count))
+    if kr != 0:
+        count = natural_t(38)
+        kr = libc.host_statistics64(libc.mach_host_self(), HOST_VM_INFO64, byref(vm), byref(count))
+    return vm if kr == 0 else None
+
+
+def swap_used() -> int:
+    usage = SwapUsage()
+    size = ctypes.c_size_t(ctypes.sizeof(usage))
+    if libc.sysctlbyname(b"vm.swapusage", byref(usage), byref(size), None, 0) != 0:
+        return 0
+    return int(usage.used)
+
+
+def list_pids() -> list[int]:
+    need = libc.proc_listallpids(None, 0)
+    if need <= 0:
+        need = 512
+    buf = (c_int * (need + 64))()
+    got = libc.proc_listallpids(buf, ctypes.sizeof(buf))
+    if got <= 0:
+        return []
+    count = got if got <= need + 64 else got // ctypes.sizeof(c_int)
+    return [int(buf[i]) for i in range(count) if buf[i] > 0]
+
+
+def proc_name(pid: int) -> str:
+    buf = ctypes.create_string_buffer(256)
+    if libc.proc_name(pid, buf, 256) <= 0:
+        return ""
+    return buf.value.decode(errors="replace")
+
+
+def proc_task(pid: int) -> ProcTaskInfo | None:
+    info = ProcTaskInfo()
+    size = libc.proc_pidinfo(pid, PROC_PIDTASKINFO, 0, byref(info), ctypes.sizeof(info))
+    if size <= 0:
+        return None
+    return info
+
+
+def fmt_bytes(n: float) -> str:
+    n = float(max(0, n))
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024 or unit == "T":
+            if unit == "B":
+                return f"{int(n)}B"
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}T"
+
+
+def fmt_rate(n: float) -> str:
+    return fmt_bytes(n) + "/s"
+
+
+def bar(pct: float, width: int) -> str:
+    pct = max(0.0, min(100.0, pct))
+    width = max(8, width)
+    filled = int(round(pct / 100 * width))
+    color = GREEN if pct < 60 else AMBER if pct < 85 else RED
+    return f"{color}{'█' * filled}{DIM}{'░' * (width - filled)}{RST}"
+
+
+def spark(values: list[float], width: int) -> str:
+    if not values or width <= 0:
+        return ""
+    data = values[-width:]
+    peak = max(data) or 1
+    chars = []
+    for value in data:
+        idx = int(round((value / peak) * (len(SPARK) - 1)))
+        chars.append(SPARK[max(0, min(len(SPARK) - 1, idx))])
+    pad = width - len(chars)
+    return f"{DIM}{' ' * pad}{CYAN}{''.join(chars)}{RST}"
+
+
+def tone(pct: float) -> str:
+    if pct < 60:
+        return GREEN
+    if pct < 85:
+        return AMBER
+    return RED
+
+
+def core_row(cores: list[float], p_n: int, e_n: int) -> str:
+    def paint(values: list[float]) -> str:
+        bits = []
+        for value in values:
+            idx = int(round(max(0.0, min(100.0, value)) / 100 * (len(SPARK) - 1)))
+            bits.append(f"{tone(value)}{SPARK[idx]}{RST}")
+        return "".join(bits)
+
+    if p_n and e_n and p_n + e_n == len(cores):
+        return f"{DIM}P{RST} {paint(cores[:p_n])}  {DIM}E{RST} {paint(cores[p_n:])}"
+    return paint(cores)
+
+
+def stack_bar(segments: list[tuple[float, str]], width: int) -> str:
+    width = max(8, width)
+    total = sum(max(0.0, amount) for amount, _color in segments) or 1.0
+    counts = [int(round(max(0.0, amount) / total * width)) for amount, _color in segments]
+    drift = sum(counts) - width
+    order = sorted(range(len(counts)), key=lambda i: counts[i], reverse=True)
+    step = 1 if drift > 0 else -1
+    guard = 0
+    while drift != 0 and guard < width * 4:
+        for index in order:
+            if drift == 0:
+                break
+            if drift > 0 and counts[index] > 0:
+                counts[index] -= 1
+                drift -= 1
+            elif drift < 0:
+                counts[index] += 1
+                drift += 1
+        guard += 1
+    parts = []
+    for cells, (_amount, color) in zip(counts, segments):
+        if cells <= 0:
+            continue
+        glyph = "░" if color == DIM else "█"
+        parts.append(f"{color}{glyph * cells}{RST}")
+    return "".join(parts)
+
+
+def fmt_uptime(seconds: float) -> str:
+    total = max(0, int(seconds))
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _sec = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def boot_sec() -> int:
+    class Timeval(ctypes.Structure):
+        _fields_ = [("sec", ctypes.c_int64), ("usec", ctypes.c_int32), ("pad", ctypes.c_int32)]
+
+    tv = Timeval()
+    size = ctypes.c_size_t(ctypes.sizeof(tv))
+    if libc.sysctlbyname(b"kern.boottime", byref(tv), byref(size), None, 0) != 0:
+        return 0
+    return int(tv.sec)
+
+
+def machine_info() -> dict:
+    model = sysctl_str("hw.model") or "Mac"
+    total = sysctl_u64("hw.memsize") or 0
+    page = sysctl_u64("hw.pagesize") or 16384
+    p_cores = sysctl_u32("hw.perflevel0.physicalcpu") or 0
+    e_cores = sysctl_u32("hw.perflevel1.physicalcpu") or 0
+    return {
+        "host": socket.gethostname().split(".")[0],
+        "model_id": model,
+        "chip": CHIPS.get(model, model),
+        "mem_total": total,
+        "page": page,
+        "p_cores": p_cores,
+        "e_cores": e_cores,
+        "boot": boot_sec(),
+    }
+
+
+class Engine:
+    def __init__(self) -> None:
+        self.info = machine_info()
+        self.lock = threading.Lock()
+        self.extra = {
+            "ollama_up": False,
+            "model": "",
+            "quant": "",
+            "params": "",
+            "vram": 0,
+            "ctx": 0,
+            "family": "",
+            "expires": "",
+            "rx": 0.0,
+            "tx": 0.0,
+            "bench_gen": None,
+            "bench_prefill": None,
+            "bench_state": "",
+            "bench_error": "",
+        }
+        self._stop = threading.Event()
+        self._cpu_prev: list[tuple[int, int, int, int]] | None = None
+        self._cpu_prev_t = 0.0
+        self._tracked: list[int] = []
+        self._scan_t = 0.0
+        self._proc_prev: dict[int, tuple[float, int]] = {}
+        self._net_prev: tuple[float, int, int] | None = None
+        self._bench_on = False
+        threading.Thread(target=self._slow, name="llmmon-slow", daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def request_bench(self) -> None:
+        with self.lock:
+            if self._bench_on:
+                return
+            self._bench_on = True
+            self.extra["bench_state"] = "running"
+            model = self.extra["model"] or "coder"
+        threading.Thread(target=self._bench, args=(model,), name="llmmon-bench", daemon=True).start()
+
+    def _bench(self, model: str) -> None:
+        body = json.dumps(
+            {
+                "model": model,
+                "prompt": "def merge_sorted(a, b):\n    \"\"\"Merge two sorted lists.\"\"\"\n",
+                "stream": False,
+                "keep_alive": -1,
+                "options": {"num_predict": 64, "temperature": 0},
+            }
+        ).encode()
+        req = urllib.request.Request(
+            OLLAMA + "/api/generate",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                data = json.loads(resp.read().decode())
+            eval_n = data.get("eval_count") or 0
+            eval_ns = data.get("eval_duration") or 0
+            prompt_n = data.get("prompt_eval_count") or 0
+            prompt_ns = data.get("prompt_eval_duration") or 0
+            gen = (eval_n / (eval_ns / 1e9)) if eval_ns else 0
+            pre = (prompt_n / (prompt_ns / 1e9)) if prompt_ns else 0
+            with self.lock:
+                self.extra["bench_gen"] = round(gen, 1)
+                self.extra["bench_prefill"] = round(pre, 1)
+                self.extra["bench_state"] = "ok"
+                self.extra["bench_error"] = ""
+        except Exception as exc:
+            with self.lock:
+                self.extra["bench_state"] = "err"
+                self.extra["bench_error"] = str(exc)[:80]
+        finally:
+            with self.lock:
+                self._bench_on = False
+
+    def _slow(self) -> None:
+        net_wait = 0.0
+        while not self._stop.is_set():
+            ollama = self._fetch_ollama()
+            rx = tx = None
+            now = time.perf_counter()
+            if now >= net_wait:
+                rx, tx = self._net_rates(now)
+                net_wait = now + 1.0
+            with self.lock:
+                self.extra.update(ollama)
+                if rx is not None:
+                    self.extra["rx"] = rx
+                    self.extra["tx"] = tx
+            self._stop.wait(0.45)
+
+    def _fetch_ollama(self) -> dict:
+        try:
+            with urllib.request.urlopen(OLLAMA + "/api/ps", timeout=0.25) as resp:
+                payload = json.loads(resp.read().decode())
+        except Exception:
+            return {"ollama_up": False}
+        models = payload.get("models") or []
+        if not models:
+            name = self._first_tag()
+            return {
+                "ollama_up": True,
+                "model": name,
+                "quant": "",
+                "params": "",
+                "vram": 0,
+                "ctx": 0,
+                "family": "",
+                "expires": "",
+            }
+        model = max(models, key=lambda item: item.get("size_vram") or item.get("size") or 0)
+        details = model.get("details") or {}
+        return {
+            "ollama_up": True,
+            "model": model.get("name") or model.get("model") or "",
+            "quant": details.get("quantization_level") or "",
+            "params": details.get("parameter_size") or "",
+            "vram": int(model.get("size_vram") or model.get("size") or 0),
+            "ctx": int(model.get("context_length") or 0),
+            "family": details.get("family") or "",
+            "expires": model.get("expires_at") or "",
+        }
+
+    def _first_tag(self) -> str:
+        try:
+            with urllib.request.urlopen(OLLAMA + "/api/tags", timeout=0.25) as resp:
+                payload = json.loads(resp.read().decode())
+        except Exception:
+            return ""
+        names = [item.get("name") or "" for item in payload.get("models") or []]
+        for preferred in ("coder:latest", "coder", "qwen2.5-coder:7b"):
+            if preferred in names:
+                return preferred
+        return names[0] if names else ""
+
+    def _net_rates(self, now: float) -> tuple[float, float] | tuple[None, None]:
+        try:
+            out = subprocess.check_output(
+                ["/usr/sbin/netstat", "-ibn"],
+                timeout=1,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return None, None
+        rx = tx = 0
+        for line in out.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 10 or not parts[0].startswith(("en", "bridge")):
+                continue
+            if "<Link" not in parts[2]:
+                continue
+            try:
+                rx += int(parts[6])
+                tx += int(parts[9])
+            except ValueError:
+                continue
+        if self._net_prev is None:
+            self._net_prev = (now, rx, tx)
+            return 0.0, 0.0
+        prev_t, prev_rx, prev_tx = self._net_prev
+        self._net_prev = (now, rx, tx)
+        dt = max(now - prev_t, 0.001)
+        return max(0.0, (rx - prev_rx) / dt), max(0.0, (tx - prev_tx) / dt)
+
+    def _scan_runners(self, now: float) -> None:
+        if now - self._scan_t < 1.0 and self._tracked:
+            return
+        self._scan_t = now
+        found = []
+        for pid in list_pids():
+            name = proc_name(pid)
+            if "ollama" in name.lower():
+                found.append(pid)
+        self._tracked = found
+
+    def snapshot(self) -> dict:
+        started = time.perf_counter()
+        ticks = cpu_ticks()
+        now = time.perf_counter()
+        cores: list[float] = []
+        if self._cpu_prev and len(self._cpu_prev) == len(ticks):
+            dt_ok = True
+            for prev, cur in zip(self._cpu_prev, ticks):
+                user = (cur[0] - prev[0]) & 0xFFFFFFFF
+                system = (cur[1] - prev[1]) & 0xFFFFFFFF
+                idle = (cur[2] - prev[2]) & 0xFFFFFFFF
+                nice = (cur[3] - prev[3]) & 0xFFFFFFFF
+                total = user + system + idle + nice
+                cores.append((100.0 * (user + system + nice) / total) if total else 0.0)
+        else:
+            dt_ok = False
+        self._cpu_prev = ticks
+        self._cpu_prev_t = now
+        p_n = self.info["p_cores"]
+        e_n = self.info["e_cores"]
+        if dt_ok and cores and p_n and p_n + e_n == len(cores):
+            cpu_p = sum(cores[:p_n]) / p_n
+            cpu_e = sum(cores[p_n:]) / e_n if e_n else 0.0
+        else:
+            cpu_p = cpu_e = 0.0
+        cpu = sum(cores) / len(cores) if cores else 0.0
+
+        vm = vm_stat()
+        page = self.info["page"]
+        mem_used = wired = compressed = active = inactive = free = 0
+        if vm is not None:
+            internal = max(0, int(vm.internal_page_count) - int(vm.purgeable_count))
+            mem_used = (internal + int(vm.wire_count) + int(vm.compressor_page_count)) * page
+            wired = int(vm.wire_count) * page
+            compressed = int(vm.compressor_page_count) * page
+            active = int(vm.active_count) * page
+            inactive = int(vm.inactive_count) * page
+            free = int(vm.free_count) * page
+        total = self.info["mem_total"]
+        if total and mem_used > total:
+            mem_used = total
+
+        self._scan_runners(now)
+        runner_cpu = 0.0
+        runner_rss = 0
+        runner_threads = 0
+        new_prev: dict[int, tuple[float, int]] = {}
+        for pid in self._tracked:
+            info = proc_task(pid)
+            if info is None:
+                continue
+            cpu_ns = int(info.total_user) + int(info.total_system)
+            runner_rss += int(info.resident_size)
+            runner_threads += int(info.threadnum)
+            new_prev[pid] = (now, cpu_ns)
+            prev = self._proc_prev.get(pid)
+            if prev:
+                dt = now - prev[0]
+                if dt > 0:
+                    runner_cpu += ((cpu_ns - prev[1]) / 1e9) / dt * 100.0
+        self._proc_prev = new_prev
+
+        try:
+            disk = os.statvfs("/System/Volumes/Data")
+        except OSError:
+            disk = os.statvfs("/")
+        disk_total = disk.f_blocks * disk.f_frsize
+        disk_free = disk.f_bavail * disk.f_frsize
+        disk_used = max(0, disk_total - disk.f_bfree * disk.f_frsize)
+
+        with self.lock:
+            extra = dict(self.extra)
+        busy = runner_cpu > 35 or extra.get("bench_state") == "running"
+        snap = {
+            "host": self.info["host"],
+            "chip": self.info["chip"],
+            "model_id": self.info["model_id"],
+            "mem_total": total,
+            "cpu": round(cpu, 1),
+            "cpu_p": round(cpu_p, 1),
+            "cpu_e": round(cpu_e, 1),
+            "cores": [round(c, 1) for c in cores],
+            "p_cores": self.info["p_cores"],
+            "e_cores": self.info["e_cores"],
+            "load": [round(v, 2) for v in os.getloadavg()],
+            "uptime": int(time.time() - self.info["boot"]) if self.info["boot"] else 0,
+            "mem_used": mem_used,
+            "wired": wired,
+            "compressed": compressed,
+            "active": active,
+            "inactive": inactive,
+            "free": free,
+            "swap": swap_used(),
+            "disk_total": disk_total,
+            "disk_free": disk_free,
+            "disk_used": disk_used,
+            "runner_cpu": round(runner_cpu, 1),
+            "runner_rss": runner_rss,
+            "runner_threads": runner_threads,
+            "busy": busy,
+            "sample_us": round((time.perf_counter() - started) * 1e6, 1),
+        }
+        snap.update(extra)
+        return snap
+
+
+class RemoteView:
+    def __init__(self, host: str) -> None:
+        self.host = host
+        self.lock = threading.Lock()
+        self.snap = None
+        self.recv_at = 0.0
+        self.status = "connecting"
+        self.err = ""
+        self.proc: subprocess.Popen | None = None
+        self._stop = threading.Event()
+        threading.Thread(target=self._loop, name="llmmon-ssh", daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        proc = self.proc
+        if proc is not None:
+            proc.kill()
+
+    def request_bench(self) -> None:
+        proc = self.proc
+        if proc is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(b"b\n")
+            proc.stdin.flush()
+        except Exception:
+            pass
+
+    def latest(self) -> tuple[dict | None, str, float, str]:
+        with self.lock:
+            age = time.time() - self.recv_at if self.recv_at else 999
+            return self.snap, self.status, age, self.err
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._session()
+            if self._stop.is_set():
+                break
+            with self.lock:
+                self.status = "reconnecting"
+            self._stop.wait(0.6)
+
+    def _session(self) -> None:
+        cmd = [
+            "ssh",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=4",
+            "-o",
+            "GSSAPIAuthentication=no",
+            "-o",
+            "PreferredAuthentications=publickey",
+            "-o",
+            "ServerAliveInterval=5",
+            "-o",
+            "ServerAliveCountMax=2",
+            "-o",
+            "LogLevel=ERROR",
+            self.host,
+            "for p in /opt/homebrew/bin/llmmon \"$HOME/bin/llmmon\" /usr/local/bin/llmmon; do [ -x \"$p\" ] && exec \"$p\" --serve; done; echo 'llmmon is not installed on this Mac' >&2; exit 127",
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        except Exception as exc:
+            with self.lock:
+                self.err = str(exc)
+            return
+        self.proc = proc
+        threading.Thread(target=self._drain, args=(proc.stderr,), daemon=True).start()
+        buf = b""
+        while not self._stop.is_set():
+            readable, _, _ = select.select([proc.stdout], [], [], 0.4)
+            if proc.poll() is not None and not readable:
+                err = ""
+                break
+            if not readable:
+                continue
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    snap = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                with self.lock:
+                    self.snap = snap
+                    self.recv_at = time.time()
+                    self.status = "ok"
+                    self.err = ""
+        if proc.poll() is None:
+            proc.kill()
+        with self.lock:
+            if self.status == "ok":
+                self.status = "down"
+
+    def _drain(self, pipe) -> None:
+        if pipe is None:
+            return
+        try:
+            data = pipe.read()
+        except Exception:
+            return
+        if data:
+            text = data.decode(errors="replace").strip().splitlines()
+            if text:
+                with self.lock:
+                    self.err = text[-1][:120]
+
+
+def pad(text: str, width: int) -> str:
+    plain = _plain(text)
+    if len(plain) > width:
+        return plain[: max(0, width - 1)] + "…"
+    return text + (" " * (width - len(plain)))
+
+
+def _plain(text: str) -> str:
+    out = []
+    ansi = False
+    for ch in text:
+        if ch == "\033":
+            ansi = True
+            continue
+        if ansi:
+            if ch.isalpha():
+                ansi = False
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def render(snap: dict | None, *, link: str, status: str, age: float, paused: bool, cols: int, spin: int) -> bytes:
+    cols = max(72, cols)
+    inner = cols - 2
+    lines = ["\033[H"]
+    for mark in MARK:
+        lines.append(f" {BOLD}{AMBER}{mark}{RST}")
+    who = os.environ.get("USER") or "linusshyu"
+    title = f" {BOLD}{AMBER}LLMMON{RST}  {AMBER}{who}{RST}  "
+    if snap:
+        title += (
+            f"{INK}{snap.get('host', '')}{RST}  {CYAN}{snap.get('chip', '')}{RST}"
+            f"  {DIM}{snap.get('model_id', '')}{RST}  {fmt_bytes(snap.get('mem_total') or 0)}"
+        )
+    else:
+        title += f"{DIM}waiting{RST}"
+    title += f"  {DIM}HEADLESS{RST}"
+    clock = time.strftime("%H:%M:%S")
+    gap = inner - len(_plain(title)) - len(clock)
+    lines.append(pad(title + (" " * max(1, gap)) + DIM + clock + RST, inner))
+    lines.append(f" {DIM}{'─' * max(8, inner - 2)}{RST}")
+
+    if snap is None:
+        spinner = "|/-\\"[spin % 4]
+        lines.append("")
+        if status == "setup":
+            lines.append(f" {AMBER}还没有要监控的机器{RST}")
+            lines.append(f" {DIM}echo 'user@mac.local' > ~/.config/llmmon/host{RST}")
+            lines.append(f" {DIM}或直接  llmmon user@mac.local{RST}")
+            lines.append(f" {DIM}本机模型  llmmon --local{RST}")
+        else:
+            label = "connecting" if status == "connecting" else status
+            lines.append(f" {AMBER}{spinner}{RST}  {label}")
+            lines.append(f" {DIM}{link}{RST}")
+        lines.append("")
+        lines.append(f" {DIM}q quit{RST}")
+        body = "\n".join("\033[2K" + line for line in lines) + "\n\033[J"
+        return body.encode()
+
+    link_line = link
+    if status != "ok":
+        spinner = "|/-\\"[spin % 4]
+        link_line = f"{AMBER}{spinner} {status}{RST}  {DIM}{link}{RST}"
+
+    bar_w = max(12, min(36, inner // 3))
+    model = snap.get("model") or "no model"
+    quant = snap.get("quant") or "—"
+    params = snap.get("params") or ""
+    family = snap.get("family") or ""
+    mem_total = float(snap.get("mem_total") or 1)
+    vram_n = float(snap.get("vram") or 0)
+    vram = fmt_bytes(vram_n) if vram_n else "not loaded"
+    vram_pct = 100.0 * vram_n / mem_total if mem_total and vram_n else 0
+    ctx = snap.get("ctx") or 0
+    ctx_s = f"ctx {ctx}" if ctx else "ctx 8192"
+    state = "GEN" if snap.get("busy") else "IDLE"
+    state_color = AMBER if snap.get("busy") else GREEN
+    pulse = "●" if spin % 2 == 0 or not snap.get("busy") else "○"
+    ollama = f"{GREEN}up{RST}" if snap.get("ollama_up") else f"{RED}down{RST}"
+    expires = str(snap.get("expires") or "")
+    keep = f"  {GREEN}keep{RST}" if expires[:4].isdigit() and int(expires[:4]) > 2100 else ""
+    lines.append(
+        pad(
+            f" {AMBER}MODEL{RST}  {INK}{model}{RST}  {DIM}{family}{RST}  {state_color}{pulse} {state}{RST}  {ollama}{keep}",
+            inner,
+        )
+    )
+    lines.append(
+        pad(
+            f"        {DIM}{params}  {quant}  {ctx_s}{RST}   Metal {CYAN}{vram}{RST} {bar(vram_pct, max(8, bar_w // 2))}",
+            inner,
+        )
+    )
+
+    bench_state = snap.get("bench_state") or ""
+    if bench_state == "running":
+        bench = f"{AMBER}measuring tok/s{RST}"
+    elif bench_state == "err":
+        bench = f"{RED}{snap.get('bench_error') or 'bench failed'}{RST}"
+    elif snap.get("bench_gen"):
+        bench = (
+            f"decode {CYAN}{snap['bench_gen']} tok/s{RST}"
+            f"   prefill {CYAN}{snap.get('bench_prefill') or 0} tok/s{RST}"
+        )
+    else:
+        bench = f"{DIM}press b to measure tok/s{RST}"
+    lines.append(pad(f"        {bench}", inner))
+
+    cpu = float(snap.get("cpu") or 0)
+    p_txt = f"P {snap.get('cpu_p', 0):4.0f}%" if snap.get("p_cores") else ""
+    e_txt = f"E {snap.get('cpu_e', 0):4.0f}%" if snap.get("e_cores") else ""
+    load = snap.get("load") or [0, 0, 0]
+    while len(load) < 3:
+        load.append(0)
+    uptime = fmt_uptime(float(snap.get("uptime") or 0))
+    lines.append("")
+    lines.append(
+        pad(
+            f" {AMBER}CPU{RST}    {tone(cpu)}{cpu:5.1f}%{RST} {bar(cpu, bar_w)}  {p_txt}  {e_txt}",
+            inner,
+        )
+    )
+    lines.append(
+        pad(
+            f"        {DIM}load {load[0]:.2f}  {load[1]:.2f}  {load[2]:.2f}   up {uptime}{RST}",
+            inner,
+        )
+    )
+    lines.append(" " + spark(snap.get("_hist_cpu") or [], min(64, inner - 2)))
+    cores = snap.get("cores") or []
+    if cores:
+        lines.append(
+            pad(
+                f"        {core_row(cores, int(snap.get('p_cores') or 0), int(snap.get('e_cores') or 0))}",
+                inner,
+            )
+        )
+
+    mem_used = float(snap.get("mem_used") or 0)
+    mem_pct = 100.0 * mem_used / mem_total if mem_total else 0
+    wired = float(snap.get("wired") or 0)
+    compressed = float(snap.get("compressed") or 0)
+    app = max(0.0, mem_used - wired - compressed)
+    free_b = max(0.0, mem_total - mem_used)
+    lines.append(
+        pad(
+            f" {AMBER}MEM{RST}    {INK}{fmt_bytes(mem_used)}{RST}/{fmt_bytes(mem_total)} {bar(mem_pct, bar_w)} {tone(mem_pct)}{mem_pct:4.0f}%{RST}",
+            inner,
+        )
+    )
+    lines.append(
+        pad(
+            "        "
+            + stack_bar(
+                [(app, GREEN), (wired, CYAN), (compressed, AMBER), (free_b, DIM)],
+                bar_w,
+            )
+            + f"  {DIM}app {fmt_bytes(app)}  wire {fmt_bytes(wired)}  comp {fmt_bytes(compressed)}  free {fmt_bytes(free_b)}{RST}",
+            inner,
+        )
+    )
+    lines.append(
+        pad(
+            f"        {DIM}active {fmt_bytes(snap.get('active') or 0)}   inactive {fmt_bytes(snap.get('inactive') or 0)}   swap {fmt_bytes(snap.get('swap') or 0)}{RST}",
+            inner,
+        )
+    )
+    lines.append(" " + spark(snap.get("_hist_mem") or [], min(64, inner - 2)))
+
+    disk_total = float(snap.get("disk_total") or 0)
+    disk_used = float(snap.get("disk_used") or 0)
+    disk_free = float(snap.get("disk_free") or 0)
+    disk_pct = 100.0 * disk_used / disk_total if disk_total else 0
+    lines.append(
+        pad(
+            f" {AMBER}DISK{RST}   {INK}{fmt_bytes(disk_used)}{RST}/{fmt_bytes(disk_total)} {bar(disk_pct, bar_w)} {tone(disk_pct)}{disk_pct:4.0f}%{RST}  {DIM}free {fmt_bytes(disk_free)}{RST}",
+            inner,
+        )
+    )
+    lines.append(
+        pad(
+            f" {AMBER}NET{RST}    {CYAN}{fmt_rate(snap.get('rx') or 0)}{RST} {DIM}down{RST}    {CYAN}{fmt_rate(snap.get('tx') or 0)}{RST} {DIM}up{RST}",
+            inner,
+        )
+    )
+    lines.append(
+        pad(
+            f" {AMBER}RUN{RST}    rss {CYAN}{fmt_bytes(snap.get('runner_rss') or 0)}{RST}   cpu {tone(float(snap.get('runner_cpu') or 0))}{float(snap.get('runner_cpu') or 0):5.1f}%{RST}   {DIM}threads {snap.get('runner_threads') or 0}{RST}",
+            inner,
+        )
+    )
+    lines.append(pad(f" {DIM}{link_line}{RST}", inner))
+
+    age_s = "—" if age > 90 else f"{age:.2f}s"
+    age_color = GREEN if age < 0.5 else AMBER if age < 1.5 else RED
+    pause = f"  {AMBER}PAUSED{RST}" if paused else ""
+    sample = snap.get("sample_us") or 0
+    lines.append(
+        pad(
+            f" {DIM}q quit   b bench   space pause{RST}{pause}   {age_color}{age_s}{RST} {DIM}ago   sample {sample:.0f}us{RST}",
+            inner,
+        )
+    )
+    body = "\n".join("\033[2K" + line for line in lines) + "\n\033[J"
+    return body.encode()
+
+
+def run_tui(source, link: str) -> None:
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    sys.stdout.write("\033[?1049h\033[?25l\033[?7l")
+    sys.stdout.flush()
+    paused = False
+    frozen = None
+    hist_cpu: list[float] = []
+    hist_mem: list[float] = []
+    spin = 0
+    try:
+        while True:
+            readable, _, _ = select.select([sys.stdin], [], [], INTERVAL)
+            if readable:
+                keys = os.read(fd, 32)
+                if b"q" in keys or b"\x03" in keys:
+                    break
+                if b" " in keys:
+                    paused = not paused
+                    if not paused:
+                        frozen = None
+                if b"b" in keys or b"B" in keys:
+                    source.request_bench()
+            if paused and frozen is not None:
+                snap, status, age, _err = frozen
+            else:
+                got = source.latest() if hasattr(source, "latest") else (source.snapshot(), "ok", 0.0, "")
+                snap, status, age, _err = got
+                if snap and status == "ok" and not paused:
+                    hist_cpu.append(float(snap.get("cpu") or 0))
+                    total = float(snap.get("mem_total") or 1)
+                    hist_mem.append(100.0 * float(snap.get("mem_used") or 0) / total)
+                    hist_cpu = hist_cpu[-180:]
+                    hist_mem = hist_mem[-180:]
+                    snap = dict(snap)
+                    snap["_hist_cpu"] = hist_cpu
+                    snap["_hist_mem"] = hist_mem
+                if paused:
+                    frozen = (snap, status, age, _err)
+            cols = os.get_terminal_size().columns
+            sys.stdout.buffer.write(render(snap, link=link, status=status, age=age, paused=paused, cols=cols, spin=spin))
+            sys.stdout.flush()
+            spin += 1
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[?25h\033[?7h\033[?1049l")
+        sys.stdout.flush()
+        source.stop()
+
+
+def print_once(snap: dict) -> None:
+    print(
+        f"{snap.get('host')}  {snap.get('chip')}  cpu {snap.get('cpu')}%  "
+        f"mem {fmt_bytes(snap.get('mem_used') or 0)}/{fmt_bytes(snap.get('mem_total') or 0)}  "
+        f"model {snap.get('model') or '-'}  vram {fmt_bytes(snap.get('vram') or 0)}  "
+        f"sample {snap.get('sample_us')}us  ollama {'up' if snap.get('ollama_up') else 'down'}"
+    )
+
+
+def serve() -> None:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    engine = Engine()
+    engine.snapshot()
+    time.sleep(0.15)
+
+    def commands() -> None:
+        while True:
+            readable, _, _ = select.select([sys.stdin], [], [], 0.2)
+            if not readable:
+                continue
+            data = os.read(sys.stdin.fileno(), 64)
+            if not data:
+                os._exit(0)
+            if b"b" in data or b"B" in data:
+                engine.request_bench()
+
+    threading.Thread(target=commands, name="llmmon-cmd", daemon=True).start()
+    while True:
+        snap = engine.snapshot()
+        try:
+            sys.stdout.write(json.dumps(snap, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+        except BrokenPipeError:
+            return
+        time.sleep(INTERVAL)
+
+
+def once_remote(host: str) -> int:
+    view = RemoteView(host)
+    deadline = time.time() + 6
+    snap = None
+    while time.time() < deadline:
+        snap, status, _age, err = view.latest()
+        if snap and status == "ok":
+            break
+        time.sleep(0.05)
+    view.stop()
+    if not snap:
+        print(err or "no snapshot", file=sys.stderr)
+        return 1
+    print_once(snap)
+    return 0
+
+
+def is_mini() -> bool:
+    host = socket.gethostname().lower()
+    model = sysctl_str("hw.model")
+    return "mac-mini" in host or model == "Mac14,3"
+
+
+class Idle:
+    def latest(self) -> tuple[None, str, float, str]:
+        return None, "setup", 999, ""
+
+    def request_bench(self) -> None:
+        return
+
+    def stop(self) -> None:
+        return
+
+
+def usage() -> str:
+    return """\
+llmmon  在这台 Mac 的 Terminal 里看另一台 Mac 上的模型
+
+用法
+  llmmon                      读取 ~/.config/llmmon/host
+  llmmon user@mac             直接指定那台机器
+  llmmon --local              监控本机
+  llmmon --once               打一行就退出
+  ./install.sh user@mac       装到本机，并装到那台机器
+
+按键
+  q 退出    b 测一次 tok/s    空格 暂停
+
+配置文件只有一行，例如 user@192.168.1.20
+也可以用环境变量 LLMMON_HOST。
+"""
+
+
+def host_from_args(args: list[str]) -> str:
+    if "--host" in args:
+        index = args.index("--host")
+        if index + 1 < len(args):
+            return args[index + 1].strip()
+    for arg in args:
+        if arg.startswith("--host="):
+            return arg.split("=", 1)[1].strip()
+        if arg.startswith("-"):
+            continue
+        if "@" in arg:
+            return arg
+    return ""
+
+
+def host_from_config() -> str:
+    env = os.environ.get("LLMMON_HOST", "").strip()
+    if env:
+        return env
+    path = os.path.expanduser("~/.config/llmmon/host")
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def main(argv: list[str]) -> int:
+    args = argv[1:]
+    if "--help" in args or "-h" in args:
+        print(usage())
+        return 0
+    if "--serve" in args:
+        serve()
+        return 0
+    explicit = host_from_args(args)
+    local = "--local" in args or (is_mini() and not explicit)
+    once = "--once" in args
+    if local:
+        engine = Engine()
+        engine.snapshot()
+        time.sleep(0.15)
+        if once:
+            print_once(engine.snapshot())
+            engine.stop()
+            return 0
+        run_tui(engine, "http://127.0.0.1:11434/v1")
+        return 0
+    host = explicit or host_from_config()
+    if not host:
+        if not sys.stdout.isatty() or once:
+            print(usage(), file=sys.stderr)
+            return 2
+        run_tui(Idle(), "llmmon user@mac")
+        return 0
+    link = f"ssh -L 11435:127.0.0.1:11434 {host}"
+    if once or not sys.stdout.isatty():
+        return once_remote(host)
+    run_tui(RemoteView(host), link)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv))
+    except KeyboardInterrupt:
+        print("\033[?25h\033[?1049l", end="")
+        raise SystemExit(130)
