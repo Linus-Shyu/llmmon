@@ -3,6 +3,48 @@
 # The model is reached through the local tool proxy.
 set -eu
 
+# Apple's Terminal quits while drawing this screen (CoreText font fallback,
+# EXC_ARM_PAC_FAIL). Warp draws its own text, so hand the session over.
+if [ "${TERM_PROGRAM:-}" = "Apple_Terminal" ] && [ "${MINICODE_WARP:-}" != 1 ]; then
+  if [ ! -d /Applications/Warp.app ]; then
+    echo "Apple 的终端画这个界面会崩溃。请换 Warp 或 iTerm 后再运行 minicode。" >&2
+    exit 1
+  fi
+  if [ -x /opt/homebrew/bin/minicode ]; then
+    bin=/opt/homebrew/bin/minicode
+  elif [ -x "$HOME/bin/minicode" ]; then
+    bin=$HOME/bin/minicode
+  else
+    bin=$0
+  fi
+  cfg="$HOME/.config/minicode/warp-launch.yaml"
+  mkdir -p "$HOME/.config/minicode"
+  python3 - "$cfg" "$(pwd)" "$bin" "$@" << 'PY'
+import shlex, sys
+cfg, cwd, *args = sys.argv[1:]
+
+def y(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+cmd = "MINICODE_WARP=1 " + " ".join(shlex.quote(a) for a in args)
+open(cfg, "w").write(
+    "---\n"
+    "name: minicode\n"
+    "windows:\n"
+    "  - tabs:\n"
+    "      - title: minicode\n"
+    "        layout:\n"
+    f"          cwd: {y(cwd)}\n"
+    "          commands:\n"
+    f"            - exec: {y(cmd)}\n"
+)
+PY
+  encoded=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$cfg")
+  open "warp://launch/$encoded"
+  echo "Apple 的终端画这个界面会崩溃，已经改到 Warp 里打开。"
+  exit 0
+fi
+
 uid=$(id -u)
 agents="$HOME/Library/LaunchAgents"
 

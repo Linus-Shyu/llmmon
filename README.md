@@ -100,6 +100,8 @@ minicode
 
 `minicode` is a terminal session, not an application you open from the Finder. It asks before it edits a file or runs a command. Leave it with `Ctrl+C`.
 
+> **Note:** Apple's Terminal quits while drawing this screen. The crash is `EXC_ARM_PAC_FAIL` in CoreText's font fallback. When Warp is installed, `minicode` opens the session there. Otherwise, run it from iTerm or Warp.
+
 ![minicode](docs/minicode.png)
 
 A 7B model on an entry-level Apple Silicon Mac produces about twenty tokens per second. It is suitable for changing one file or running one command. It often gets a change wrong when the task spans a large repository.
