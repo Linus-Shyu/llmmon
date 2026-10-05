@@ -1,0 +1,344 @@
+#!/bin/sh
+# Pick a coding model that fits this Mac, install it with Ollama,
+# and connect OpenCode so it can edit files and run commands.
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
+
+dry=0
+here=0
+model_only=0
+host=""
+
+usage() {
+  cat << 'EOF'
+按这台 Mac 的内存选择模型，装好，并接上能改文件、跑命令的工具。
+
+  ./setup-coder                 模型和工具都装在这台 Mac
+  ./setup-coder user@mac        模型装在那台 Mac，工具装在这台
+  ./setup-coder --dry-run       只打印会选哪个模型
+
+装完后，进入项目目录运行 minicode。
+EOF
+}
+
+for arg in "$@"; do
+  case $arg in
+    --dry-run) dry=1 ;;
+    --here) here=1 ;;
+    --model-only) model_only=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *@*) host=$arg ;;
+    *)
+      echo "不认识的参数: $arg" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+ssh_to() {
+  ssh -T \
+    -o BatchMode=yes \
+    -o ConnectTimeout=8 \
+    -o GSSAPIAuthentication=no \
+    -o PreferredAuthentications=publickey \
+    -o LogLevel=ERROR \
+    "$@"
+}
+
+choose_model() {
+  mem_bytes=$1
+  mem_gb=$((mem_bytes / 1024 / 1024 / 1024))
+  if [ "$mem_gb" -lt 12 ]; then
+    MODEL_TAG=qwen2.5-coder:3b
+    NUM_CTX=8192
+    REASON="内存不到 12GB。7B 会把系统挤进交换区，所以用 3B。"
+  elif [ "$mem_gb" -lt 24 ]; then
+    MODEL_TAG=qwen2.5-coder:7b
+    NUM_CTX=16384
+    REASON="12–23GB 放得下 7B Q4，并留出系统和 16384 上下文。"
+  elif [ "$mem_gb" -lt 48 ]; then
+    MODEL_TAG=qwen2.5-coder:14b
+    NUM_CTX=8192
+    REASON="24–47GB 可以放 14B Q4。上下文用 8192，避免 KV 把内存吃满。"
+  else
+    MODEL_TAG=qwen2.5-coder:32b
+    NUM_CTX=16384
+    REASON="48GB 及以上才放得下 32B Q4。"
+  fi
+}
+
+read_machine() {
+  MEM_BYTES=$(sysctl -n hw.memsize)
+  MACHINE=$(sysctl -n hw.model 2>/dev/null || echo Mac)
+  MEM_GB=$((MEM_BYTES / 1024 / 1024 / 1024))
+}
+
+print_choice() {
+  where=$1
+  echo "$where"
+  echo "  机型   $MACHINE"
+  echo "  内存   ${MEM_GB}GB"
+  echo "  模型   $MODEL_TAG"
+  echo "  上下文 $NUM_CTX"
+  echo "  $REASON"
+}
+
+install_ollama_env() {
+  plist=$HOME/Library/LaunchAgents/homebrew.mxcl.ollama.plist
+  [ -f "$plist" ] || return 0
+  /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables" "$plist" >/dev/null 2>&1 \
+    || /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$plist"
+  set_env() {
+    key=$1
+    val=$2
+    if /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$key" "$plist" >/dev/null 2>&1; then
+      /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:$key $val" "$plist"
+    else
+      /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:$key string $val" "$plist"
+    fi
+  }
+  set_env OLLAMA_FLASH_ATTENTION 1
+  set_env OLLAMA_KV_CACHE_TYPE q8_0
+  set_env OLLAMA_KEEP_ALIVE -1
+  set_env OLLAMA_MAX_LOADED_MODELS 1
+  set_env OLLAMA_NUM_PARALLEL 1
+  set_env OLLAMA_HOST 127.0.0.1:11434
+  uid=$(id -u)
+  launchctl bootout "gui/$uid/homebrew.mxcl.ollama" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$uid" "$plist"
+}
+
+wait_ollama() {
+  i=0
+  while [ "$i" -lt 40 ]; do
+    if curl -sf -m 1 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.5
+  done
+  echo "Ollama 没有在 127.0.0.1:11434 起来。" >&2
+  return 1
+}
+
+deploy_model() {
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "需要 Homebrew 才能安装 Ollama。" >&2
+    exit 1
+  fi
+  if ! command -v ollama >/dev/null 2>&1; then
+    brew install ollama
+  fi
+  brew services start ollama >/dev/null 2>&1 || true
+  install_ollama_env
+  wait_ollama
+  ollama pull "$MODEL_TAG"
+  mkdir -p "$HOME/llm"
+  cat > "$HOME/llm/Modelfile" << EOF
+FROM $MODEL_TAG
+PARAMETER num_ctx $NUM_CTX
+PARAMETER temperature 0.2
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.05
+EOF
+  ollama create coder -f "$HOME/llm/Modelfile"
+  echo "模型 coder 已就绪（来自 $MODEL_TAG）。"
+}
+
+write_plist() {
+  path=$1
+  label=$2
+  body=$3
+  mkdir -p "$(dirname "$path")"
+  cat > "$path" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$label</string>
+$body
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>
+EOF
+}
+
+bootstrap_agent() {
+  label=$1
+  plist=$2
+  uid=$(id -u)
+  launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$uid" "$plist"
+}
+
+install_proxy() {
+  upstream=$1
+  mkdir -p "$HOME/.config/minicode"
+  cp "$ROOT/minicode-proxy.py" "$HOME/.config/minicode/proxy.py"
+  chmod 755 "$HOME/.config/minicode/proxy.py"
+  plist=$HOME/Library/LaunchAgents/com.llmmon.minicode.proxy.plist
+  write_plist "$plist" com.llmmon.minicode.proxy "  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>$HOME/.config/minicode/proxy.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MINICODE_UPSTREAM</key>
+    <string>$upstream</string>
+  </dict>"
+  bootstrap_agent com.llmmon.minicode.proxy "$plist"
+}
+
+install_tunnel() {
+  remote=$1
+  plist=$HOME/Library/LaunchAgents/com.llmmon.minicode.tunnel.plist
+  write_plist "$plist" com.llmmon.minicode.tunnel "  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/ssh</string>
+    <string>-N</string>
+    <string>-L</string>
+    <string>11435:127.0.0.1:11434</string>
+    <string>-o</string>
+    <string>ExitOnForwardFailure=yes</string>
+    <string>-o</string>
+    <string>BatchMode=yes</string>
+    <string>-o</string>
+    <string>ConnectTimeout=6</string>
+    <string>-o</string>
+    <string>GSSAPIAuthentication=no</string>
+    <string>-o</string>
+    <string>PreferredAuthentications=publickey</string>
+    <string>-o</string>
+    <string>ServerAliveInterval=15</string>
+    <string>-o</string>
+    <string>ServerAliveCountMax=3</string>
+    <string>-o</string>
+    <string>LogLevel=ERROR</string>
+    <string>$remote</string>
+  </array>"
+  bootstrap_agent com.llmmon.minicode.tunnel "$plist"
+}
+
+install_opencode() {
+  if ! command -v opencode >/dev/null 2>&1; then
+    brew install anomalyco/tap/opencode-v2
+  fi
+  config=$HOME/.config/opencode/opencode.json
+  if [ -f "$config" ]; then
+    echo "已有 $config，没有覆盖。"
+    return 0
+  fi
+  mkdir -p "$HOME/.config/opencode"
+  cat > "$config" << 'EOF'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "mini/coder",
+  "providers": {
+    "mini": {
+      "name": "Local coder",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:11436/v1",
+        "apiKey": "ollama"
+      },
+      "models": {
+        "coder": {
+          "modelID": "coder",
+          "name": "coder",
+          "capabilities": {
+            "tools": true,
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 16384,
+            "output": 2048
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+}
+
+install_launcher() {
+  mkdir -p "$HOME/bin" /usr/local/bin
+  cp "$ROOT/minicode" "$HOME/bin/minicode"
+  chmod 755 "$HOME/bin/minicode"
+  if [ -w /opt/homebrew/bin ]; then
+    ln -sfn "$HOME/bin/minicode" /opt/homebrew/bin/minicode
+  fi
+  if [ -w /usr/local/bin ]; then
+    ln -sfn "$HOME/bin/minicode" /usr/local/bin/minicode
+  fi
+  case ":${PATH:-}:" in
+    *":$HOME/bin:"*) ;;
+    *)
+      echo "把这一行加进 ~/.zshrc 后新开一个终端窗口："
+      echo "  export PATH=\"\$HOME/bin:\$PATH\""
+      ;;
+  esac
+}
+
+install_tools() {
+  upstream=$1
+  remote=${2:-}
+  install_opencode
+  if [ -n "$remote" ]; then
+    install_tunnel "$remote"
+    install_proxy "http://127.0.0.1:11435"
+  else
+    install_proxy "$upstream"
+  fi
+  install_launcher
+  echo "工具已接上。进入项目目录后运行: minicode"
+}
+
+deploy_remote() {
+  remote=$1
+  echo "读取 $remote 的内存……"
+  spec=$(ssh_to "$remote" 'printf "%s %s\n" "$(sysctl -n hw.memsize)" "$(sysctl -n hw.model)"')
+  MEM_BYTES=${spec%% *}
+  MACHINE=${spec#* }
+  MEM_GB=$((MEM_BYTES / 1024 / 1024 / 1024))
+  choose_model "$MEM_BYTES"
+  print_choice "将在 $remote 上安装模型"
+  if [ "$dry" -eq 1 ]; then
+    echo "这台 Mac 只安装工具，通过 SSH 隧道使用那边的模型。"
+    exit 0
+  fi
+  ssh_to "$remote" 'mkdir -p "$HOME/.config/minicode"'
+  scp -o BatchMode=yes -o ConnectTimeout=8 -o GSSAPIAuthentication=no -o PreferredAuthentications=publickey \
+    "$ROOT/setup-coder" "$ROOT/minicode-proxy.py" "$ROOT/minicode" \
+    "$remote:.config/minicode/"
+  ssh_to "$remote" 'export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; sh "$HOME/.config/minicode/setup-coder" --here --model-only'
+  install_tools "http://127.0.0.1:11434" "$remote"
+  if [ -x "$ROOT/install.sh" ]; then
+    "$ROOT/install.sh" "$remote"
+  fi
+}
+
+if [ -n "$host" ] && [ "$here" -eq 0 ]; then
+  deploy_remote "$host"
+  exit 0
+fi
+
+read_machine
+choose_model "$MEM_BYTES"
+print_choice "将在这台 Mac 上安装"
+if [ "$dry" -eq 1 ]; then
+  exit 0
+fi
+deploy_model
+if [ "$model_only" -eq 0 ]; then
+  install_tools "http://127.0.0.1:11434"
+fi

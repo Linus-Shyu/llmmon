@@ -1,0 +1,45 @@
+#!/bin/sh
+# Start a coding session in the current directory.
+# The model is reached through the local tool proxy.
+set -eu
+
+uid=$(id -u)
+agents="$HOME/Library/LaunchAgents"
+
+start_agent() {
+  label=$1
+  plist=$agents/$label.plist
+  [ -f "$plist" ] || return 0
+  if launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
+    return 0
+  fi
+  launchctl bootstrap "gui/$uid" "$plist"
+}
+
+start_agent com.llmmon.minicode.tunnel
+start_agent com.llmmon.minicode.proxy
+
+ready=0
+i=0
+while [ "$i" -lt 20 ]; do
+  if curl -sf -m 1 http://127.0.0.1:11436/v1/models >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  i=$((i + 1))
+  sleep 0.4
+done
+
+if [ "$ready" -ne 1 ]; then
+  echo "模型没有连上。先跑一次 ./setup-coder，并确认那台 Mac 开着。" >&2
+  exit 1
+fi
+
+if [ -x /opt/homebrew/bin/opencode ]; then
+  exec /opt/homebrew/bin/opencode --standalone "$@"
+fi
+if command -v opencode >/dev/null 2>&1; then
+  exec opencode --standalone "$@"
+fi
+echo "没有找到 opencode。先跑一次 ./setup-coder。" >&2
+exit 1

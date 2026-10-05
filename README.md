@@ -31,6 +31,37 @@ llmmon
 export PATH="$HOME/bin:$PATH"
 ```
 
+## 按内存安装模型，并接上工具
+
+`setup-coder` 先看这台 Mac 的统一内存，再选一个放得下的 Qwen2.5-Coder，用 Ollama 装成 `coder`，然后接上 OpenCode。接上之后，模型可以改当前目录里的文件，也可以跑终端命令。小模型有时只把工具调用写成一段 JSON，仓库里的 `minicode-proxy.py` 会把它补成标准的工具调用。
+
+```sh
+./setup-coder
+```
+
+模型放在另一台 Mac、工具留在你面前这台时：
+
+```sh
+./setup-coder user@那台Mac
+```
+
+只看会选哪个模型、先不下载：
+
+```sh
+./setup-coder --dry-run
+```
+
+| 内存 | 模型 | 上下文 |
+| --- | --- | --- |
+| 不到 12GB | Qwen2.5-Coder 3B | 8192 |
+| 12–23GB | Qwen2.5-Coder 7B | 16384 |
+| 24–47GB | Qwen2.5-Coder 14B | 8192 |
+| 48GB 及以上 | Qwen2.5-Coder 32B | 16384 |
+
+装完后进入项目目录，运行 `minicode`。这是终端里的对话，不是一个可以点开的 App。它要改文件或跑命令时会先问你。退出按 `Ctrl+C`。
+
+7B 在入门级 Apple Silicon 上大约每秒二十个 token。它适合改一个文件、跑一条命令。整个大仓库的修改它经常会写错。
+
 ## 只看本机
 
 模型就在这台 Mac 上时：
@@ -62,7 +93,7 @@ llmmon --local
 
 ## 用这台模型写代码
 
-监控走 SSH，不依赖 Ollama 是否对局域网开放。建议 Ollama 只听本机 `127.0.0.1:11434`。
+模型的安装和工具连接用上面的 `./setup-coder`。监控走 SSH，不依赖 Ollama 是否对局域网开放。建议 Ollama 只听本机 `127.0.0.1:11434`。
 
 在你这台 Mac 上开一条隧道（本机如果已经有 Ollama，不要占 11434）：
 
