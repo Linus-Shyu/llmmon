@@ -2,6 +2,8 @@
 
 在你面前这台 Mac 的 Terminal 里，实时看另一台 Mac 上的本地模型。
 
+![llmmon](docs/screenshot.png)
+
 画面画在你运行 `llmmon` 的机器上。远端只采样，每 0.2 秒发一行 JSON。键盘和刷新都不走整屏 SSH，所以按键是本地的。
 
 不需要额外 Python 包。macOS 自带的 Python 3 就够。
