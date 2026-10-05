@@ -134,33 +134,21 @@ The remote Mac can have its display unplugged, as long as the user stays logged 
 
 Do not log out. Do not restart the machine while no display is attached. With FileVault, a restart waits for the disk to be unlocked at the machine before SSH returns.
 
-To keep the Mac awake after the display is unplugged, install a LaunchAgent on the remote user account, for example `~/Library/LaunchAgents/com.user.keepawake.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.user.keepawake</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/bin/caffeinate</string>
-    <string>-ims</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-</dict>
-</plist>
-```
-
-Then:
+On the Mac that runs the model:
 
 ```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.keepawake.plist
+./serve.sh
 ```
+
+This holds sleep off with `caffeinate`, and every five minutes loads `coder` again if Ollama restarted empty. `OLLAMA_KEEP_ALIVE=-1` then keeps that model resident.
+
+`serve.sh` also tries to set the machine power policy. That step needs an administrator password. The command it prints is:
+
+```bash
+sudo pmset -a sleep 0 disksleep 0 displaysleep 0 powernap 0 autorestart 0 tcpkeepalive 1 womp 1
+```
+
+`autorestart 0` matters when FileVault is on. A power loss that restarts the Mac otherwise stops at the disk unlock screen, and SSH does not return until someone unlocks it with a display attached.
 
 `setup-coder` sets the following on the Homebrew Ollama LaunchAgent when that file exists. `llmmon` itself does not change Ollama's configuration. To keep the model resident without `setup-coder`, set the same variables and bootstrap the service again:
 

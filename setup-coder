@@ -318,7 +318,7 @@ deploy_remote() {
   fi
   ssh_to "$remote" 'mkdir -p "$HOME/.config/minicode"'
   scp -o BatchMode=yes -o ConnectTimeout=8 -o GSSAPIAuthentication=no -o PreferredAuthentications=publickey \
-    "$ROOT/setup-coder" "$ROOT/minicode-proxy.py" "$ROOT/minicode" \
+    "$ROOT/setup-coder" "$ROOT/minicode-proxy.py" "$ROOT/minicode" "$ROOT/serve.sh" \
     "$remote:.config/minicode/"
   ssh_to "$remote" 'export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; sh "$HOME/.config/minicode/setup-coder" --here --model-only'
   install_tools "http://127.0.0.1:11434" "$remote"
@@ -339,6 +339,9 @@ if [ "$dry" -eq 1 ]; then
   exit 0
 fi
 deploy_model
+if [ -f "$ROOT/serve.sh" ]; then
+  sh "$ROOT/serve.sh"
+fi
 if [ "$model_only" -eq 0 ]; then
   install_tools "http://127.0.0.1:11434"
 fi
