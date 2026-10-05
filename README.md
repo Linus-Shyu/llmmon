@@ -60,6 +60,8 @@ export PATH="$HOME/bin:$PATH"
 
 装完后进入项目目录，运行 `minicode`。这是终端里的对话，不是一个可以点开的 App。它要改文件或跑命令时会先问你。退出按 `Ctrl+C`。
 
+![minicode](docs/minicode.png)
+
 7B 在入门级 Apple Silicon 上大约每秒二十个 token。它适合改一个文件、跑一条命令。整个大仓库的修改它经常会写错。
 
 ## 只看本机
