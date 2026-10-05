@@ -241,6 +241,15 @@ install_opencode() {
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "mini/coder",
+  "skills": [],
+  "permission": {
+    "skill": "deny",
+    "webfetch": "deny",
+    "websearch": "deny",
+    "subagent": "deny",
+    "question": "deny",
+    "execute": "deny"
+  },
   "providers": {
     "mini": {
       "name": "Local coder",
