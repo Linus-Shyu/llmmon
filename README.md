@@ -1,129 +1,138 @@
 # llmmon
 
-在你面前这台 Mac 的 Terminal 里，实时看另一台 Mac 上的本地模型。
+llmmon is a terminal monitor for a local model running on a Mac. The display is drawn on the machine where you run the command. The machine that runs the model only samples, and sends one line of JSON every 0.2 seconds. Keys and redraws stay local, so the session does not depend on a full-screen SSH connection.
 
 ![llmmon](docs/screenshot.png)
 
-画面画在你运行 `llmmon` 的机器上。远端只采样，每 0.2 秒发一行 JSON。键盘和刷新都不走整屏 SSH，所以按键是本地的。
+The monitor needs no extra Python packages. The Python 3 that ships with macOS is enough.
 
-不需要额外 Python 包。macOS 自带的 Python 3 就够。
+## Setup
 
-## 装好就能用
+On the Mac where you want the display:
 
-在你平时敲命令的那台 Mac 上：
-
-```sh
+```bash
 git clone https://github.com/Linus-Shyu/llmmon.git
 cd llmmon
 ./install.sh user@192.168.1.20
 llmmon
 ```
 
-把 `user@192.168.1.20` 换成跑模型的那台 Mac。第一次 SSH 要能免密登录（公钥）。安装脚本会：
+Replace `user@192.168.1.20` with the Mac that runs the model. The first connection has to succeed with a public key. `ssh user@host` should open a shell without asking for a password.
 
-1. 把 `llmmon` 放到本机 `~/bin/llmmon`
-2. 把同一份脚本放到远端的 `/opt/homebrew/bin/llmmon`（没有 Homebrew 就放到远端 `~/bin/llmmon`）
-3. 把地址写进 `~/.config/llmmon/host`，之后直接打 `llmmon` 即可
+`./install.sh` does three things:
 
-如果 `~/bin` 不在 PATH 里，脚本会提示你加一行到 `~/.zshrc`：
+1. Copies `llmmon` to `~/bin/llmmon` on this Mac.
+2. Copies the same script to `/opt/homebrew/bin/llmmon` on the remote Mac. If that directory is not writable, it uses `~/bin/llmmon` on the remote Mac.
+3. Writes the address to `~/.config/llmmon/host`, so later you can run `llmmon` with no arguments.
 
-```sh
+If `~/bin` is not on `PATH`, the script prints the line to add to `~/.zshrc`:
+
+```bash
 export PATH="$HOME/bin:$PATH"
 ```
 
-## 按内存安装模型，并接上工具
+Open a new terminal after changing `PATH`.
 
-`setup-coder` 先看这台 Mac 的统一内存，再选一个放得下的 Qwen2.5-Coder，用 Ollama 装成 `coder`，然后接上 OpenCode。接上之后，模型可以改当前目录里的文件，也可以跑终端命令。小模型有时只把工具调用写成一段 JSON，仓库里的 `minicode-proxy.py` 会把它补成标准的工具调用。
+To watch a model on the same Mac:
 
-```sh
-./setup-coder
-```
-
-模型放在另一台 Mac、工具留在你面前这台时：
-
-```sh
-./setup-coder user@那台Mac
-```
-
-只看会选哪个模型、先不下载：
-
-```sh
-./setup-coder --dry-run
-```
-
-| 内存 | 模型 | 上下文 |
-| --- | --- | --- |
-| 不到 12GB | Qwen2.5-Coder 3B | 8192 |
-| 12–23GB | Qwen2.5-Coder 7B | 16384 |
-| 24–47GB | Qwen2.5-Coder 14B | 8192 |
-| 48GB 及以上 | Qwen2.5-Coder 32B | 16384 |
-
-装完后进入项目目录，运行 `minicode`。这是终端里的对话，不是一个可以点开的 App。它要改文件或跑命令时会先问你。退出按 `Ctrl+C`。
-
-![minicode](docs/minicode.png)
-
-7B 在入门级 Apple Silicon 上大约每秒二十个 token。它适合改一个文件、跑一条命令。整个大仓库的修改它经常会写错。
-
-## 只看本机
-
-模型就在这台 Mac 上时：
-
-```sh
+```bash
 ./install.sh
 llmmon --local
 ```
 
-## 按键
+> **Note:** If the display stays on `connecting`, confirm that `ssh user@host` works without a password, then run `./install.sh user@host` again. The remote Mac needs an executable `llmmon`. GSSAPI is already disabled. A hand-written `ssh` command should include `-o GSSAPIAuthentication=no -o PreferredAuthentications=publickey`. Sampling does not use `powermetrics` and does not need `sudo`.
 
-| 键 | 作用 |
+## Command-line usage
+
+```bash
+llmmon                         # host from ~/.config/llmmon/host
+llmmon user@mac                # host for this run
+llmmon --local                 # this Mac
+llmmon --once                  # print one status line and exit
+llmmon user@mac --once
+llmmon --help
+```
+
+The host is taken from the command line, then from `LLMMON_HOST`, then from `~/.config/llmmon/host`. The file is one address per run. Lines that start with `#` are comments.
+
+| Key | Action |
 | --- | --- |
-| `q` | 退出 |
-| `b` | 让远端模型生成一小段代码，测 decode / prefill tok/s |
-| 空格 | 暂停画面，再按一次继续 |
+| `q` | Quit |
+| `b` | Ask the model for a short completion and report decode / prefill tok/s |
+| space | Pause the display. Press again to resume |
 
-## 画面
+The colors are fixed. Titles are amber, numbers and sparklines are cyan, and usage bars go from green to amber to red as they fill.
 
-配色是固定的：标题和分区是琥珀色，数字和曲线是青色，用量条按占用从绿到琥珀再到红。
+- **MODEL**: loaded model, parameter count, quantization, context length, Metal memory, and whether the model is kept resident
+- **CPU**: total use, performance and efficiency cores, 1/5/15-minute load, uptime, a sparkline, and each core
+- **MEM**: memory in use, a stacked bar (app, wired, compressed, free), active, inactive, and swap
+- **DISK / NET**: the data volume, and throughput on the network interface
+- **RUN**: resident memory, CPU, and thread count of the Ollama process
 
-- **MODEL**：当前加载的模型、参数量、量化、上下文、Metal 显存、是否常驻
-- **CPU**：总占用、性能核 / 能效核、1/5/15 分钟负载、开机时长、曲线、每颗核
-- **MEM**：已用内存、分层条（应用 / 接线 / 压缩 / 空闲）、active、inactive、swap
-- **DISK / NET**：数据卷占用，以及网卡上下行
-- **RUN**：Ollama 进程的驻留内存、CPU、线程数
+If `~/.config/fastfetch/linus_art.txt` exists, those lines are drawn above the title. Without that file, the display starts at the title.
 
-有 `~/.config/fastfetch/linus_art.txt` 时，字标会画在最上面。没有这个文件就只显示标题。
+## Models
 
-## 用这台模型写代码
+`setup-coder` reads the unified memory of a Mac and installs a Qwen2.5-Coder build that fits, through Ollama, under the name `coder`. It then connects [OpenCode](https://opencode.ai) so the model can edit files in the current directory and run terminal commands. Smaller models sometimes emit a tool call as plain JSON. `minicode-proxy.py` turns that JSON into a normal tool call.
 
-模型的安装和工具连接用上面的 `./setup-coder`。监控走 SSH，不依赖 Ollama 是否对局域网开放。建议 Ollama 只听本机 `127.0.0.1:11434`。
+```bash
+./setup-coder                  # model and tools on this Mac
+./setup-coder user@mac         # model on that Mac, tools on this one
+./setup-coder --dry-run        # print the choice, and do not download
+```
 
-在你这台 Mac 上开一条隧道（本机如果已经有 Ollama，不要占 11434）：
+`setup-coder` needs Homebrew. It installs Ollama if it is missing, and installs OpenCode with `brew install anomalyco/tap/opencode-v2` if `opencode` is missing. An existing `~/.config/opencode/opencode.json` is left as it is.
 
-```sh
+| Memory | Model | Context |
+| --- | --- | --- |
+| under 12 GB | Qwen2.5-Coder 3B | 8192 |
+| 12–23 GB | Qwen2.5-Coder 7B | 16384 |
+| 24–47 GB | Qwen2.5-Coder 14B | 8192 |
+| 48 GB and above | Qwen2.5-Coder 32B | 16384 |
+
+On a 12–23 GB machine the 7B model is the one that fits and still leaves room for the system and a 16384-token context. A 14B or 32B model on that machine is pushed into swap.
+
+After installation, change to a project directory and run:
+
+```bash
+minicode
+```
+
+`minicode` is a terminal session, not an application you open from the Finder. It asks before it edits a file or runs a command. Leave it with `Ctrl+C`.
+
+![minicode](docs/minicode.png)
+
+A 7B model on an entry-level Apple Silicon Mac produces about twenty tokens per second. It is suitable for changing one file or running one command. It often gets a change wrong when the task spans a large repository.
+
+The monitor reaches the remote Mac over SSH. It does not require Ollama to listen on the LAN. Leave Ollama on `127.0.0.1:11434`.
+
+If this Mac already runs Ollama, forward the remote server to `11435` so you do not replace the local server on `11434`:
+
+```bash
 ssh -f -N -L 11435:127.0.0.1:11434 user@192.168.1.20
 ```
 
-OpenAI 兼容接口：
+The OpenAI-compatible endpoint is:
 
 ```text
 http://127.0.0.1:11435/v1
 ```
 
-模型名用 Ollama 里的名字，例如 `coder`。
+Use the name Ollama has for the model, for example `coder`.
 
-想直接在终端里聊天：
+To talk to the model in a remote shell:
 
-```sh
+```bash
 ssh -t user@192.168.1.20 'export PATH=/opt/homebrew/bin:$PATH; ollama run coder'
 ```
 
-## 不接显示器
+## Running without a display
 
-可以拔掉远端的显示器，人留在登录状态。Apple Silicon 的 Metal 在这种情况下仍然工作。
+The remote Mac can have its display unplugged, as long as the user stays logged in. Metal on Apple Silicon still runs in that state.
 
-不要注销，也不要在没接显示器时重启。开了 FileVault 的话，重启后要在本机解锁磁盘，SSH 才会回来。
+Do not log out. Do not restart the machine while no display is attached. With FileVault, a restart waits for the disk to be unlocked at the machine before SSH returns.
 
-防止拔掉显示器后系统睡眠，在远端用户目录放一个 LaunchAgent，路径例如 `~/Library/LaunchAgents/com.user.keepawake.plist`：
+To keep the Mac awake after the display is unplugged, install a LaunchAgent on the remote user account, for example `~/Library/LaunchAgents/com.user.keepawake.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -145,39 +154,23 @@ ssh -t user@192.168.1.20 'export PATH=/opt/homebrew/bin:$PATH; ollama run coder'
 </plist>
 ```
 
-然后：
+Then:
 
-```sh
+```bash
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.keepawake.plist
 ```
 
-让模型常驻内存，可以在 Ollama 的 LaunchAgent 里加上：
+`setup-coder` sets the following on the Homebrew Ollama LaunchAgent when that file exists. `llmmon` itself does not change Ollama's configuration. To keep the model resident without `setup-coder`, set the same variables and bootstrap the service again:
 
 ```text
 OLLAMA_KEEP_ALIVE=-1
 OLLAMA_FLASH_ATTENTION=1
 OLLAMA_KV_CACHE_TYPE=q8_0
+OLLAMA_MAX_LOADED_MODELS=1
+OLLAMA_NUM_PARALLEL=1
 OLLAMA_HOST=127.0.0.1:11434
 ```
 
-改完后重新 bootstrap 那个服务。`llmmon` 本身不改 Ollama 配置。
+## License
 
-## 配置
-
-优先级：命令行 `user@host`，然后是环境变量 `LLMMON_HOST`，然后是 `~/.config/llmmon/host`。文件里一行地址，`#` 开头是注释。
-
-```sh
-llmmon --help
-llmmon --once          # 打一行状态
-llmmon user@mac --once
-```
-
-## 常见问题
-
-**打开后停在 connecting。** 先 `ssh user@host` 确认免密能进。远端要有可执行的 `llmmon`，再跑一次 `./install.sh user@host`。
-
-**SSH 要卡好几秒。** 脚本已经关掉了 GSSAPI。如果自己手写 `ssh`，加上 `-o GSSAPIAuthentication=no -o PreferredAuthentications=publickey`。
-
-**本机也装了 Ollama，隧道连错机器。** 转发到 `11435`，不要覆盖本机的 `11434`。
-
-**采样很慢或要输密码。** 监控不使用 `powermetrics`，也不需要 sudo。
+llmmon is released under the MIT License. See [LICENSE](LICENSE) for further details.
