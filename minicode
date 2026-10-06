@@ -71,9 +71,7 @@ if [ ! -s "$upstream_file" ]; then
   exit 1
 fi
 launchctl bootout "gui/$uid/com.llmmon.minicode.tunnel" >/dev/null 2>&1 || true
-launchctl bootout "gui/$uid/com.linusshyu.minicode.tunnel" >/dev/null 2>&1 || true
 start_agent com.llmmon.minicode.proxy
-start_agent com.linusshyu.minicode.proxy
 
 ready=0
 i=0

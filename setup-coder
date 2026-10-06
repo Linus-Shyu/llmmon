@@ -149,7 +149,7 @@ PARAMETER top_p 0.9
 PARAMETER repeat_penalty 1.05
 EOF
   ollama create coder -f "$HOME/llm/Modelfile"
-  echo "模型 coder 已就绪（来自 $MODEL_TAG）。"
+  echo "模型 coder 已就绪（来自 ${MODEL_TAG}）。"
 }
 
 write_plist() {
@@ -244,7 +244,7 @@ install_opencode() {
   fi
   config=$HOME/.config/opencode/opencode.json
   if [ -f "$config" ]; then
-    echo "已有 $config，没有覆盖。"
+    echo "已有 ${config}，没有覆盖。"
     return 0
   fi
   mkdir -p "$HOME/.config/opencode"
