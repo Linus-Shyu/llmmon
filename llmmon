@@ -866,6 +866,22 @@ class RemoteView:
                     self.err = text[-1][:120]
 
 
+def frame(lines: list[str]) -> bytes:
+    # Home first. Clearing before the cursor is homed leaves the previous
+    # top line on screen, and a refresh shows that clipped fragment.
+    body = "\033[H" + "\n".join("\033[2K" + line for line in lines) + "\n\033[J"
+    return body.encode()
+
+
+def mark_lines(cols: int) -> list[str]:
+    shown = []
+    for mark in MARK:
+        if 1 + len(mark) > cols:
+            return []
+        shown.append(f" {BOLD}{AMBER}{mark}{RST}")
+    return shown
+
+
 def pad(text: str, width: int) -> str:
     plain = _plain(text)
     if len(plain) > width:
@@ -937,9 +953,7 @@ def render(
 ) -> bytes:
     cols = max(72, cols)
     inner = cols - 2
-    lines = ["\033[H"]
-    for mark in MARK:
-        lines.append(f" {BOLD}{AMBER}{mark}{RST}")
+    lines = mark_lines(cols)
     who = os.environ.get("USER") or "linusshyu"
     title = f" {BOLD}{AMBER}LLMMON{RST}  {AMBER}{who}{RST}  "
     if snap:
@@ -973,8 +987,7 @@ def render(
             lines.extend(machine_band("MACBOOK", local_snap, inner=inner))
             lines.append("")
         lines.append(f" {DIM}q quit{RST}")
-        body = "\n".join("\033[2K" + line for line in lines) + "\n\033[J"
-        return body.encode()
+        return frame(lines)
 
     link_line = link
     if status != "ok":
@@ -1124,8 +1137,7 @@ def render(
             inner,
         )
     )
-    body = "\n".join("\033[2K" + line for line in lines) + "\n\033[J"
-    return body.encode()
+    return frame(lines)
 
 
 def run_tui(source, link: str, local=None) -> None:
