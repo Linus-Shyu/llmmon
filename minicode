@@ -47,6 +47,13 @@ fi
 
 uid=$(id -u)
 agents="$HOME/Library/LaunchAgents"
+upstream_file="$HOME/.config/minicode/upstream"
+
+eval "set -- $(python3 -c '
+import shlex, sys
+skip = {"mini", "--mini", "macmini", "local", "--local", "here", "macbook"}
+print(" ".join(shlex.quote(a) for a in sys.argv[1:] if a not in skip))
+' "$@")"
 
 start_agent() {
   label=$1
@@ -58,7 +65,12 @@ start_agent() {
   launchctl bootstrap "gui/$uid" "$plist"
 }
 
-start_agent com.llmmon.minicode.tunnel
+mkdir -p "$HOME/.config/minicode"
+if [ ! -s "$upstream_file" ]; then
+  echo "把模型地址写进 $upstream_file" >&2
+  exit 1
+fi
+launchctl bootout "gui/$uid/com.llmmon.minicode.tunnel" >/dev/null 2>&1 || true
 start_agent com.llmmon.minicode.proxy
 
 ready=0
@@ -73,7 +85,7 @@ while [ "$i" -lt 20 ]; do
 done
 
 if [ "$ready" -ne 1 ]; then
-  echo "模型没有连上。先跑一次 ./setup-coder，并确认那台 Mac 开着。" >&2
+  echo "模型没有连上。确认那台 Mac 开着，并且 cloudflared 在跑。" >&2
   exit 1
 fi
 

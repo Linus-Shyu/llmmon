@@ -8,6 +8,7 @@ A headless Mac only samples and sends one small JSON line, five times a second.
 from __future__ import annotations
 
 import ctypes
+import hmac
 import json
 import os
 import select
@@ -663,6 +664,86 @@ class Engine:
         return snap
 
 
+class PublicView:
+    def __init__(self, url: str) -> None:
+        self.url = url.rstrip("/")
+        self.token = monitor_file("token")
+        self.lock = threading.Lock()
+        self.snap = None
+        self.recv_at = 0.0
+        self.status = "connecting"
+        self.err = ""
+        self._stop = threading.Event()
+        threading.Thread(target=self._loop, name="llmmon-http", daemon=True).start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def request_bench(self) -> None:
+        self._curl("/bench", method="POST")
+
+    def latest(self) -> tuple[dict | None, str, float, str]:
+        with self.lock:
+            age = time.time() - self.recv_at if self.recv_at else 999
+            return self.snap, self.status, age, self.err
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            code, body, err = self._curl("/snapshot")
+            if code == 200 and body:
+                try:
+                    snap = json.loads(body)
+                except json.JSONDecodeError:
+                    snap = None
+                if snap is not None:
+                    with self.lock:
+                        self.snap = snap
+                        self.recv_at = time.time()
+                        self.status = "ok"
+                        self.err = ""
+                else:
+                    with self.lock:
+                        self.status = "bad response"
+                        self.err = body[:120]
+            else:
+                with self.lock:
+                    self.status = "down" if self.snap else "connecting"
+                    self.err = err or f"HTTP {code}"
+            self._stop.wait(0.4)
+
+    def _curl(self, path: str, method: str = "GET") -> tuple[int, str, str]:
+        cmd = [
+            "curl",
+            "-sS",
+            "-m",
+            "4",
+            "-A",
+            "minicode",
+            "-X",
+            method,
+            "-H",
+            f"Authorization: Bearer {self.token}",
+            "-w",
+            "\n%{http_code}",
+            self.url + path,
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        except Exception as exc:
+            return 0, "", str(exc)
+        text = proc.stdout or ""
+        if "\n" in text:
+            body, code_s = text.rsplit("\n", 1)
+        else:
+            body, code_s = "", text
+        try:
+            code = int(code_s.strip() or "0")
+        except ValueError:
+            code = 0
+        err_lines = (proc.stderr or "").strip().splitlines()
+        return code, body, (err_lines[-1][:120] if err_lines else "")
+
+
 class RemoteView:
     def __init__(self, host: str) -> None:
         self.host = host
@@ -807,7 +888,53 @@ def _plain(text: str) -> str:
     return "".join(out)
 
 
-def render(snap: dict | None, *, link: str, status: str, age: float, paused: bool, cols: int, spin: int) -> bytes:
+def machine_band(label: str, snap: dict | None, *, inner: int) -> list[str]:
+    bar_w = max(10, min(24, inner // 5))
+    if not snap:
+        return [pad(f" {AMBER}{label}{RST}  {DIM}waiting{RST}", inner)]
+    model = snap.get("model") or "no model"
+    state = "GEN" if snap.get("busy") else "IDLE"
+    state_color = AMBER if snap.get("busy") else GREEN
+    ollama = f"{GREEN}up{RST}" if snap.get("ollama_up") else f"{RED}down{RST}"
+    cpu = float(snap.get("cpu") or 0)
+    mem_total = float(snap.get("mem_total") or 1)
+    mem_used = float(snap.get("mem_used") or 0)
+    mem_pct = 100.0 * mem_used / mem_total if mem_total else 0
+    disk_total = float(snap.get("disk_total") or 0)
+    disk_used = float(snap.get("disk_used") or 0)
+    disk_pct = 100.0 * disk_used / disk_total if disk_total else 0
+    return [
+        pad(
+            f" {AMBER}{label}{RST}  {INK}{snap.get('host', '')}{RST}  {CYAN}{snap.get('chip', '')}{RST}"
+            f"  {INK}{model}{RST}  {state_color}{state}{RST}  {ollama}",
+            inner,
+        ),
+        pad(
+            f" {AMBER}CPU{RST}    {tone(cpu)}{cpu:5.1f}%{RST} {bar(cpu, bar_w)}"
+            f"   {AMBER}MEM{RST} {INK}{fmt_bytes(mem_used)}{RST}/{fmt_bytes(mem_total)}"
+            f" {tone(mem_pct)}{mem_pct:3.0f}%{RST}",
+            inner,
+        ),
+        pad(
+            f" {AMBER}DISK{RST}   {INK}{fmt_bytes(disk_used)}{RST}/{fmt_bytes(disk_total)}"
+            f" {tone(disk_pct)}{disk_pct:3.0f}%{RST}"
+            f"   {DIM}free {fmt_bytes(snap.get('disk_free') or 0)}  swap {fmt_bytes(snap.get('swap') or 0)}{RST}",
+            inner,
+        ),
+    ]
+
+
+def render(
+    snap: dict | None,
+    *,
+    link: str,
+    status: str,
+    age: float,
+    paused: bool,
+    cols: int,
+    spin: int,
+    local_snap: dict | None = None,
+) -> bytes:
     cols = max(72, cols)
     inner = cols - 2
     lines = ["\033[H"]
@@ -841,6 +968,10 @@ def render(snap: dict | None, *, link: str, status: str, age: float, paused: boo
             lines.append(f" {AMBER}{spinner}{RST}  {label}")
             lines.append(f" {DIM}{link}{RST}")
         lines.append("")
+        if local_snap is not None:
+            lines.append(f" {DIM}{'─' * max(8, inner - 2)}{RST}")
+            lines.extend(machine_band("MACBOOK", local_snap, inner=inner))
+            lines.append("")
         lines.append(f" {DIM}q quit{RST}")
         body = "\n".join("\033[2K" + line for line in lines) + "\n\033[J"
         return body.encode()
@@ -979,6 +1110,10 @@ def render(snap: dict | None, *, link: str, status: str, age: float, paused: boo
     )
     lines.append(pad(f" {DIM}{link_line}{RST}", inner))
 
+    if local_snap is not None:
+        lines.append(f" {DIM}{'─' * max(8, inner - 2)}{RST}")
+        lines.extend(machine_band("MACBOOK", local_snap, inner=inner))
+
     age_s = "—" if age > 90 else f"{age:.2f}s"
     age_color = GREEN if age < 0.5 else AMBER if age < 1.5 else RED
     pause = f"  {AMBER}PAUSED{RST}" if paused else ""
@@ -993,7 +1128,7 @@ def render(snap: dict | None, *, link: str, status: str, age: float, paused: boo
     return body.encode()
 
 
-def run_tui(source, link: str) -> None:
+def run_tui(source, link: str, local=None) -> None:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
@@ -1033,8 +1168,20 @@ def run_tui(source, link: str) -> None:
                     snap["_hist_mem"] = hist_mem
                 if paused:
                     frozen = (snap, status, age, _err)
+            local_snap = local.snapshot() if local is not None else None
             cols = os.get_terminal_size().columns
-            sys.stdout.buffer.write(render(snap, link=link, status=status, age=age, paused=paused, cols=cols, spin=spin))
+            sys.stdout.buffer.write(
+                render(
+                    snap,
+                    link=link,
+                    status=status,
+                    age=age,
+                    paused=paused,
+                    cols=cols,
+                    spin=spin,
+                    local_snap=local_snap,
+                )
+            )
             sys.stdout.flush()
             spin += 1
     finally:
@@ -1042,6 +1189,8 @@ def run_tui(source, link: str) -> None:
         sys.stdout.write("\033[?25h\033[?7h\033[?1049l")
         sys.stdout.flush()
         source.stop()
+        if local is not None:
+            local.stop()
 
 
 def print_once(snap: dict) -> None:
@@ -1051,6 +1200,89 @@ def print_once(snap: dict) -> None:
         f"model {snap.get('model') or '-'}  vram {fmt_bytes(snap.get('vram') or 0)}  "
         f"sample {snap.get('sample_us')}us  ollama {'up' if snap.get('ollama_up') else 'down'}"
     )
+
+
+def monitor_file(name: str) -> str:
+    env = {"token": "LLMMON_TOKEN", "url": "LLMMON_URL"}.get(name, "")
+    if env:
+        value = os.environ.get(env, "").strip()
+        if value:
+            return value
+    path = os.path.expanduser(f"~/.config/llmmon/{name}")
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def serve_http() -> None:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    token = monitor_file("token")
+    if not token:
+        print("missing ~/.config/llmmon/token", file=sys.stderr)
+        raise SystemExit(1)
+    engine = Engine()
+    engine.snapshot()
+    time.sleep(0.15)
+    state = {"snap": engine.snapshot()}
+    lock = threading.Lock()
+
+    def sample() -> None:
+        while True:
+            snap = engine.snapshot()
+            with lock:
+                state["snap"] = snap
+            time.sleep(INTERVAL)
+
+    threading.Thread(target=sample, name="llmmon-sample", daemon=True).start()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt: str, *args) -> None:
+            return
+
+        def _send(self, code: int, body: bytes, content_type: str = "application/json") -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _allowed(self) -> bool:
+            got = self.headers.get("Authorization", "")
+            expect = f"Bearer {token}"
+            if len(got) == len(expect) and hmac.compare_digest(got, expect):
+                return True
+            self._send(401, b"unauthorized")
+            return False
+
+        def do_GET(self) -> None:
+            if not self._allowed():
+                return
+            if self.path.split("?", 1)[0] != "/snapshot":
+                self._send(404, b"not found")
+                return
+            with lock:
+                snap = state["snap"]
+            self._send(200, json.dumps(snap, separators=(",", ":")).encode())
+
+        def do_POST(self) -> None:
+            if not self._allowed():
+                return
+            if self.path.split("?", 1)[0] != "/bench":
+                self._send(404, b"not found")
+                return
+            engine.request_bench()
+            self._send(204, b"")
+
+    ThreadingHTTPServer(("127.0.0.1", 11437), Handler).serve_forever()
 
 
 def serve() -> None:
@@ -1081,8 +1313,7 @@ def serve() -> None:
         time.sleep(INTERVAL)
 
 
-def once_remote(host: str) -> int:
-    view = RemoteView(host)
+def once_remote_view(view) -> int:
     deadline = time.time() + 6
     snap = None
     while time.time() < deadline:
@@ -1120,9 +1351,9 @@ def usage() -> str:
 llmmon  在这台 Mac 的 Terminal 里看另一台 Mac 上的模型
 
 用法
-  llmmon                      读取 ~/.config/llmmon/host
-  llmmon user@mac             直接指定那台机器
-  llmmon --local              监控本机
+  llmmon                      读取 ~/.config/llmmon/host，并在下面显示这台 MacBook
+  llmmon user@mac             直接指定那台机器，同时显示这台 MacBook
+  llmmon --local              只监控本机
   llmmon --once               打一行就退出
   ./install.sh user@mac       装到本机，并装到那台机器
 
@@ -1170,6 +1401,9 @@ def main(argv: list[str]) -> int:
     if "--help" in args or "-h" in args:
         print(usage())
         return 0
+    if "--serve-http" in args:
+        serve_http()
+        return 0
     if "--serve" in args:
         serve()
         return 0
@@ -1186,6 +1420,13 @@ def main(argv: list[str]) -> int:
             return 0
         run_tui(engine, "http://127.0.0.1:11434/v1")
         return 0
+    url = "" if "--ssh" in args else monitor_file("url")
+    if url and not local:
+        view = PublicView(url)
+        if once or not sys.stdout.isatty():
+            return once_remote_view(view)
+        run_tui(view, url, Engine())
+        return 0
     host = explicit or host_from_config()
     if not host:
         if not sys.stdout.isatty() or once:
@@ -1195,8 +1436,8 @@ def main(argv: list[str]) -> int:
         return 0
     link = f"ssh -L 11435:127.0.0.1:11434 {host}"
     if once or not sys.stdout.isatty():
-        return once_remote(host)
-    run_tui(RemoteView(host), link)
+        return once_remote_view(RemoteView(host))
+    run_tui(RemoteView(host), link, Engine())
     return 0
 
 

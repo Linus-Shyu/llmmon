@@ -242,6 +242,9 @@ install_opencode() {
   "$schema": "https://opencode.ai/config.json",
   "model": "mini/coder",
   "skills": [],
+  "instructions": [
+    "When the user asks you to create, change, or run a file, call write and then shell. Do not describe the steps, and do not tell the user to paste the code. Python is already installed as python3. Never install Python."
+  ],
   "permission": {
     "skill": "deny",
     "webfetch": "deny",
