@@ -1,158 +1,154 @@
 # llmmon
 
-llmmon is a terminal monitor for a local model running on a Mac. The display is drawn on the machine where you run the command. The machine that runs the model only samples, and sends one line of JSON every 0.2 seconds. Keys and redraws stay local, so the session does not depend on a full-screen SSH connection.
+在一台 Mac 上跑本地模型，在另一台 Mac 的终端里看它的占用，并用这个模型改当前目录里的文件。画面画在你面前这台电脑上。跑模型的那台只往外送数据，不需要接受别人连进来的 SSH。
 
 ![llmmon](docs/screenshot.png)
 
-The monitor needs no extra Python packages. The Python 3 that ships with macOS is enough.
+监控只用 macOS 自带的 Python 3，没有第三方包。
 
-## Setup
+## 一台机器上的两行
 
-On the Mac where you want the display:
-
-```bash
-git clone https://github.com/Linus-Shyu/llmmon.git
-cd llmmon
-./install.sh user@192.168.1.20
-llmmon
-```
-
-Replace `user@192.168.1.20` with the Mac that runs the model. The first connection has to succeed with a public key. `ssh user@host` should open a shell without asking for a password.
-
-`./install.sh` does three things:
-
-1. Copies `llmmon` to `~/bin/llmmon` on this Mac.
-2. Copies the same script to `/opt/homebrew/bin/llmmon` on the remote Mac. If that directory is not writable, it uses `~/bin/llmmon` on the remote Mac.
-3. Writes the address to `~/.config/llmmon/host`, so later you can run `llmmon` with no arguments.
-
-If `~/bin` is not on `PATH`, the script prints the line to add to `~/.zshrc`:
+先在**跑模型的那台 Mac** 上安装。[Homebrew](https://brew.sh) 要已经装好。
 
 ```bash
-export PATH="$HOME/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/Linus-Shyu/llmmon/main/install.sh | sh -s -- --server
 ```
 
-Open a new terminal after changing `PATH`.
-
-To watch a model on the same Mac:
+这一行会做完这些事：按内存选择并下载一个编程模型，起名为 `coder`；装上原版 [OpenCode](https://opencode.ai)；打开本机工具代理；用 Cloudflare 往外开隧道。结束时它打印**另一行**。把那一行贴到你平时看屏幕的那台 Mac 上。那一行的样子是：
 
 ```bash
-./install.sh
-llmmon --local
+curl -fsSL https://raw.githubusercontent.com/Linus-Shyu/llmmon/main/install.sh | sh -s -- --url https://监控地址 --token 一串密钥 --upstream https://模型地址
 ```
 
-> **Note:** If the display stays on `connecting`, confirm that `ssh user@host` works without a password, then run `./install.sh user@host` again. The remote Mac needs an executable `llmmon`. GSSAPI is already disabled. A hand-written `ssh` command should include `-o GSSAPIAuthentication=no -o PreferredAuthentications=publickey`. Sampling does not use `powermetrics` and does not need `sudo`.
-
-## Command-line usage
+然后：
 
 ```bash
-llmmon                         # host from ~/.config/llmmon/host
-llmmon user@mac                # host for this run
-llmmon --local                 # this Mac
-llmmon --once                  # print one status line and exit
-llmmon user@mac --once
-llmmon --help
+llmmon      # 看占用
+minicode    # 在当前目录里让模型改文件、跑命令
 ```
 
-The host is taken from the command line, then from `LLMMON_HOST`, then from `~/.config/llmmon/host`. The file is one address per run. Lines that start with `#` are comments.
+仓库已经克隆下来的话，等价命令是 `./install.sh --server`。
 
-| Key | Action |
+临时隧道的地址在 `cloudflared` 重启后会变。在跑模型的那台 Mac 上再执行一次 `./tunnel.sh`，把新打印的那一行贴到另一台 Mac。已经写在 `~/.cloudflared/config.yml` 里的命名隧道不会变地址。监控要指到本机 `127.0.0.1:11437`，Ollama 要指到 `127.0.0.1:11434`。
+
+## 装好之后
+
+`llmmon` 每 0.2 秒收一行状态，按键和重绘都在你面前这台电脑上。
+
+| 按键 | 作用 |
 | --- | --- |
-| `q` | Quit |
-| `b` | Ask the model for a short completion and report decode / prefill tok/s |
-| space | Pause the display. Press again to resume |
+| `q` | 退出 |
+| `b` | 让模型生成一小段，显示解码和预填的 token/秒 |
+| 空格 | 暂停画面，再按一次继续 |
 
-The colors are fixed. Titles are amber, numbers and sparklines are cyan, and usage bars go from green to amber to red as they fill.
+画面上的颜色是固定的。标题是琥珀色，数字和走势是青色，用量条从绿到琥珀再到红。
 
-- **MODEL**: loaded model, parameter count, quantization, context length, Metal memory, and whether the model is kept resident
-- **CPU**: total use, performance and efficiency cores, 1/5/15-minute load, uptime, a sparkline, and each core
-- **MEM**: memory in use, a stacked bar (app, wired, compressed, free), active, inactive, and swap
-- **DISK / NET**: the data volume, and throughput on the network interface
-- **RUN**: resident memory, CPU, and thread count of the Ollama process
+- **MODEL**：正在用的模型、参数量、量化、上下文长度、显存，以及模型有没有常驻
+- **CPU**：总占用、性能核和能效核、1/5/15 分钟负载、开机时间、走势、每个核
+- **MEM**：已用内存，以及应用、联动、压缩、空闲的分层，还有交换分区
+- **DISK / NET**：数据卷和网卡吞吐
+- **RUN**：Ollama 进程的内存、CPU 和线程数
 
-If `~/.config/fastfetch/linus_art.txt` exists, those lines are drawn above the title. Without that file, the display starts at the title.
+如果 `~/.config/fastfetch/linus_art.txt` 存在，那些行画在标题上面。没有这个文件就从标题开始。
 
-## Models
-
-`setup-coder` reads the unified memory of a Mac and installs a Qwen2.5-Coder build that fits, through Ollama, under the name `coder`. It then connects [OpenCode](https://opencode.ai) so the model can edit files in the current directory and run terminal commands. Smaller models sometimes emit a tool call as plain JSON. `minicode-proxy.py` turns that JSON into a normal tool call.
-
-```bash
-./setup-coder                  # model and tools on this Mac
-./setup-coder user@mac         # model on that Mac, tools on this one
-./setup-coder --dry-run        # print the choice, and do not download
-```
-
-`setup-coder` needs Homebrew. It installs Ollama if it is missing, and installs OpenCode with `brew install anomalyco/tap/opencode-v2` if `opencode` is missing. An existing `~/.config/opencode/opencode.json` is left as it is.
-
-| Memory | Model | Context |
-| --- | --- | --- |
-| under 12 GB | Qwen2.5-Coder 3B | 8192 |
-| 12–23 GB | Qwen2.5-Coder 7B | 16384 |
-| 24–47 GB | Qwen2.5-Coder 14B | 8192 |
-| 48 GB and above | Qwen2.5-Coder 32B | 16384 |
-
-On a 12–23 GB machine the 7B model is the one that fits and still leaves room for the system and a 16384-token context. A 14B or 32B model on that machine is pushed into swap.
-
-After installation, change to a project directory and run:
-
-```bash
-minicode
-```
-
-`minicode` is a terminal session, not an application you open from the Finder. It asks before it edits a file or runs a command. Leave it with `Ctrl+C`.
-
-The config written by `setup-coder` does not load installed skills, web search, or subagents. On a 7B model those descriptions are thousands of tokens, and every turn spends its time reading them before it writes anything. A new session picks up the shorter prompt. An already-open session keeps the old one until you leave it and start again.
-
-> **Note:** Apple's Terminal quits while drawing this screen. The crash is `EXC_ARM_PAC_FAIL` in CoreText's font fallback. When Warp is installed, `minicode` opens the session there. Otherwise, run it from iTerm or Warp.
+`minicode` 是终端里的会话，不是从访达打开的应用。它调用本机的 OpenCode，模型地址走本机 `127.0.0.1:11436` 的代理。改文件或跑命令之前会问你。用 `Ctrl+C` 离开。系统自带的「终端」画这个界面会崩溃（CoreText 字体回退里的 `EXC_ARM_PAC_FAIL`）。装了 Warp 时，`minicode` 会改到 Warp 里打开。否则用 iTerm 或 Warp。
 
 ![minicode](docs/minicode.png)
 
-A 7B model on an entry-level Apple Silicon Mac produces about twenty tokens per second. It is suitable for changing one file or running one command. It often gets a change wrong when the task spans a large repository.
+入门款 Apple 芯片上，7B 四比特大约每秒 20 个 token。适合改一个文件或跑一条命令。任务铺开到整个大仓库时，它经常改错。
 
-The monitor reaches the remote Mac over SSH. It does not require Ollama to listen on the LAN. Leave Ollama on `127.0.0.1:11434`.
+## 模型怎么选
 
-If this Mac already runs Ollama, forward the remote server to `11435` so you do not replace the local server on `11434`:
+`setup-coder` 读这台 Mac 的统一内存，用 Ollama 装一个放得下的 Qwen2.5-Coder，对外的名字是 `coder`。
 
-```bash
-ssh -f -N -L 11435:127.0.0.1:11434 user@192.168.1.20
-```
+| 内存 | 模型 | 上下文 |
+| --- | --- | --- |
+| 不到 12GB | Qwen2.5-Coder 3B | 8192 |
+| 12–23GB | Qwen2.5-Coder 7B | 16384 |
+| 24–47GB | Qwen2.5-Coder 14B | 8192 |
+| 48GB 及以上 | Qwen2.5-Coder 32B | 16384 |
 
-The OpenAI-compatible endpoint is:
+12–23GB 的机器用 7B。这个大小放得下，还留得下系统和 16384 的上下文。在这台机器上装 14B 或 32B 会被推进交换分区。
+
+写给 OpenCode 的配置不加载已安装的技能、网页搜索和子代理。7B 模型读这些说明就要花掉几千 token，每一轮还没写代码就先把时间耗在读说明上。新开会话用短提示。已经开着的会话要退出再开，才会换上新提示。已经存在的 `~/.config/opencode/opencode.json` 不会被覆盖。
+
+OpenCode 本体不改。安装的是 Homebrew 里的 `anomalyco/tap/opencode-v2`。
+
+## 各文件做什么
+
+| 文件 | 作用 |
+| --- | --- |
+| `llmmon` | 终端监控。`--local` 看本机，`--serve` 从标准输出送状态，`--serve-http` 在 `127.0.0.1:11437` 提供 `/snapshot` |
+| `install.sh` | 一行安装的入口。`--server` 装模型那台，`--url` 装看画面那台 |
+| `setup-coder` | 按内存装 `coder`，并接上 OpenCode |
+| `minicode` | 启动 OpenCode，模型走本机代理 |
+| `minicode-proxy.py` | 把小模型吐出的普通 JSON 工具调用，转成 OpenCode 要的 `tool_calls`。听 `127.0.0.1:11436` |
+| `tunnel.sh` | 在跑模型的 Mac 上用 cloudflared 往外开隧道 |
+| `serve.sh` | 防止睡眠，Ollama 空了就重新载入 `coder`，然后调用 `tunnel.sh` |
+
+看画面的那台 Mac 优先读 `~/.config/llmmon/url` 和 `~/.config/llmmon/token`，用 HTTPS 拉 `/snapshot`。没有这个地址时，才用 `~/.config/llmmon/host` 里的 `user@host` 走 SSH。环境变量 `LLMMON_URL`、`LLMMON_TOKEN`、`LLMMON_HOST` 可以盖过文件。
+
+模型地址写在 `~/.config/minicode/upstream`。代理先读这个文件，文件没有时才用启动项里的 `MINICODE_UPSTREAM`。
+
+Ollama 留在 `127.0.0.1:11434`，不要直接开到局域网。另一台电脑通过隧道访问。
+
+## 配置文件
+
+跑模型的那台：
 
 ```text
-http://127.0.0.1:11435/v1
+~/.config/llmmon/token          监控用的密钥，自动生成
+~/.config/llmmon/url            监控的公网地址
+~/.config/minicode/upstream     模型的公网地址
+~/Library/LaunchAgents/com.llmmon.http.plist
+~/Library/LaunchAgents/com.llmmon.cloudflared.plist       已有命名隧道时
+~/Library/LaunchAgents/com.llmmon.tunnel-monitor.plist    临时隧道
+~/Library/LaunchAgents/com.llmmon.tunnel-ollama.plist     临时隧道
+~/Library/LaunchAgents/com.llmmon.keepawake.plist
+~/Library/LaunchAgents/com.llmmon.warmup.plist
 ```
 
-Use the name Ollama has for the model, for example `coder`.
+看画面的那台：
 
-To talk to the model in a remote shell:
+```text
+~/.config/llmmon/url
+~/.config/llmmon/token
+~/.config/minicode/upstream
+~/.config/minicode/proxy.py
+~/.config/opencode/opencode.json
+~/Library/LaunchAgents/com.llmmon.minicode.proxy.plist
+```
+
+监控地址带密钥。模型地址没有登录，知道地址的人都能调用。不要把模型地址发到公开场合。
+
+## 显示器可以拔掉
+
+跑模型的 Mac 可以不接显示器，但用户要保持登录。Apple 芯片上的 Metal 在这种状态下仍然工作。不要注销。注销会卸掉模型，因为 GPU 属于这个用户的会话。
+
+`serve.sh` 用 `caffeinate` 阻止睡眠，并每五分钟检查一次。Ollama 重启后如果是空的，它会重新载入 `coder`。`OLLAMA_KEEP_ALIVE=-1` 让这个模型一直留在内存里。
+
+电源策略需要管理员密码。脚本自己改不了的时候，会把命令打印出来：
 
 ```bash
-ssh -t user@192.168.1.20 'export PATH=/opt/homebrew/bin:$PATH; ollama run coder'
+sudo pmset -a sleep 0 disksleep 0 displaysleep 0 powernap 0 standby 0 hibernatemode 0 tcpkeepalive 1 womp 1 autorestart 1 lowpowermode 0
+sudo pmset -a SleepOnPowerButton 0
+sudo systemsetup -setrestartpowerfailure on
+sudo systemsetup -setrestartfreeze on
+sudo softwareupdate --schedule off
 ```
 
-## Running without a display
+`autorestart 1` 让电脑断电来电后自己开机。Ollama 仍然要等那个用户登录之后才启动，因为 Metal 只在这个会话里可用。
 
-The remote Mac can have its display unplugged, as long as the user stays logged in. Metal on Apple Silicon still runs in that state.
-
-Do not log out. Do not restart the machine while no display is attached. With FileVault, a restart waits for the disk to be unlocked at the machine before SSH returns.
-
-On the Mac that runs the model:
+开着 FileVault 时，重启会停在解锁磁盘的画面，自动登录开不了，没人解锁就没有 SSH，也没有模型。要在旁边没有人的时候自己回来，先关掉 FileVault，等到 `fdesetup status` 显示已经关闭，再给跑 Ollama 的那个账户打开自动登录：
 
 ```bash
-./serve.sh
+sudo fdesetup disable
+sudo sysadminctl -autologin set -userName 你的用户名
 ```
 
-This holds sleep off with `caffeinate`, and every five minutes loads `coder` again if Ollama restarted empty. `OLLAMA_KEEP_ALIVE=-1` then keeps that model resident.
+`sysadminctl` 会问这个用户的密码。账户保持登录。下次断电之后，Ollama、`caffeinate` 和重新载入 `coder` 的任务会自己起来。
 
-`serve.sh` also tries to set the machine power policy. That step needs an administrator password. The command it prints is:
-
-```bash
-sudo pmset -a sleep 0 disksleep 0 displaysleep 0 powernap 0 autorestart 0 tcpkeepalive 1 womp 1
-```
-
-`autorestart 0` matters when FileVault is on. A power loss that restarts the Mac otherwise stops at the disk unlock screen, and SSH does not return until someone unlocks it with a display attached.
-
-`setup-coder` sets the following on the Homebrew Ollama LaunchAgent when that file exists. `llmmon` itself does not change Ollama's configuration. To keep the model resident without `setup-coder`, set the same variables and bootstrap the service again:
+`setup-coder` 会在 Homebrew 的 Ollama 启动项里写上下面这些变量。只跑 `llmmon`、不跑 `setup-coder` 时，Ollama 的配置不会被改。
 
 ```text
 OLLAMA_KEEP_ALIVE=-1
@@ -161,8 +157,28 @@ OLLAMA_KV_CACHE_TYPE=q8_0
 OLLAMA_MAX_LOADED_MODELS=1
 OLLAMA_NUM_PARALLEL=1
 OLLAMA_HOST=127.0.0.1:11434
+OLLAMA_GPU_OVERHEAD=1073741824
 ```
 
-## License
+## 还有这些命令
 
-llmmon is released under the MIT License. See [LICENSE](LICENSE) for further details.
+```bash
+llmmon                         # 有 url 就看隧道，否则看 ~/.config/llmmon/host
+llmmon user@mac                # 这一次走 SSH
+llmmon --local                 # 只看本机
+llmmon --once                  # 打一行就退出
+llmmon --help
+
+./setup-coder                  # 模型和工具都装在这台 Mac
+./setup-coder user@mac         # 模型装到那台 Mac，并让它开隧道；隧道失败才退回 SSH
+./setup-coder --upstream URL   # 模型已经在这个地址上，只接本机的 OpenCode
+./setup-coder --dry-run        # 只打印会选哪个模型
+./tunnel.sh                    # 只重开隧道
+./serve.sh                     # 保活，并重开隧道
+```
+
+`setup-coder user@mac` 仍然需要公钥登录，而且 `ssh user@mac` 不能再问密码。隧道一旦开好，平时使用不再走这条 SSH。
+
+## 许可
+
+MIT。见 [LICENSE](LICENSE)。

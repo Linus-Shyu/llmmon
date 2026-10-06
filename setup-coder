@@ -10,28 +10,31 @@ dry=0
 here=0
 model_only=0
 host=""
+upstream_url=""
 
 usage() {
   cat << 'EOF'
 按这台 Mac 的内存选择模型，装好，并接上能改文件、跑命令的工具。
 
   ./setup-coder                 模型和工具都装在这台 Mac
-  ./setup-coder user@mac        模型装在那台 Mac，工具装在这台
+  ./setup-coder user@mac        模型装在那台 Mac，并让它开隧道
+  ./setup-coder --upstream URL  模型已经在这个地址上，只接本机工具
   ./setup-coder --dry-run       只打印会选哪个模型
 
 装完后，进入项目目录运行 minicode。
 EOF
 }
 
-for arg in "$@"; do
-  case $arg in
-    --dry-run) dry=1 ;;
-    --here) here=1 ;;
-    --model-only) model_only=1 ;;
+while [ $# -gt 0 ]; do
+  case $1 in
+    --dry-run) dry=1; shift ;;
+    --here) here=1; shift ;;
+    --model-only) model_only=1; shift ;;
+    --upstream) upstream_url=${2:-}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *@*) host=$arg ;;
+    *@*) host=$1; shift ;;
     *)
-      echo "不认识的参数: $arg" >&2
+      echo "不认识的参数: $1" >&2
       usage >&2
       exit 2
       ;;
@@ -106,6 +109,7 @@ install_ollama_env() {
   set_env OLLAMA_MAX_LOADED_MODELS 1
   set_env OLLAMA_NUM_PARALLEL 1
   set_env OLLAMA_HOST 127.0.0.1:11434
+  set_env OLLAMA_GPU_OVERHEAD 1073741824
   uid=$(id -u)
   launchctl bootout "gui/$uid/homebrew.mxcl.ollama" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$uid" "$plist"
@@ -183,10 +187,17 @@ install_proxy() {
   mkdir -p "$HOME/.config/minicode"
   cp "$ROOT/minicode-proxy.py" "$HOME/.config/minicode/proxy.py"
   chmod 755 "$HOME/.config/minicode/proxy.py"
+  if [ -x /opt/homebrew/bin/python3 ]; then
+    py=/opt/homebrew/bin/python3
+  elif [ -x /usr/bin/python3 ]; then
+    py=/usr/bin/python3
+  else
+    py=$(command -v python3)
+  fi
   plist=$HOME/Library/LaunchAgents/com.llmmon.minicode.proxy.plist
   write_plist "$plist" com.llmmon.minicode.proxy "  <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
+    <string>$py</string>
     <string>$HOME/.config/minicode/proxy.py</string>
   </array>
   <key>EnvironmentVariables</key>
@@ -330,14 +341,31 @@ deploy_remote() {
   fi
   ssh_to "$remote" 'mkdir -p "$HOME/.config/minicode"'
   scp -o BatchMode=yes -o ConnectTimeout=8 -o GSSAPIAuthentication=no -o PreferredAuthentications=publickey \
-    "$ROOT/setup-coder" "$ROOT/minicode-proxy.py" "$ROOT/minicode" "$ROOT/serve.sh" \
+    "$ROOT/setup-coder" "$ROOT/minicode-proxy.py" "$ROOT/minicode" "$ROOT/serve.sh" "$ROOT/tunnel.sh" "$ROOT/llmmon" \
     "$remote:.config/minicode/"
   ssh_to "$remote" 'export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; sh "$HOME/.config/minicode/setup-coder" --here --model-only'
+  monitor=$(ssh_to "$remote" 'grep -v "^#" "$HOME/.config/llmmon/url" | head -1' || true)
+  token=$(ssh_to "$remote" 'grep -v "^#" "$HOME/.config/llmmon/token" | head -1' || true)
+  upstream=$(ssh_to "$remote" 'grep -v "^#" "$HOME/.config/minicode/upstream" | head -1' || true)
+  if [ -n "$monitor" ] && [ -n "$upstream" ]; then
+    install_tools "$upstream"
+    if [ -x "$ROOT/install.sh" ]; then
+      "$ROOT/install.sh" --url "$monitor" --token "$token"
+    fi
+    echo "已改走隧道，不再开 SSH 转发。"
+    return 0
+  fi
+  echo "隧道没有起来，改用 SSH 转发。"
   install_tools "http://127.0.0.1:11434" "$remote"
   if [ -x "$ROOT/install.sh" ]; then
     "$ROOT/install.sh" "$remote"
   fi
 }
+
+if [ -n "$upstream_url" ]; then
+  install_tools "$upstream_url"
+  exit 0
+fi
 
 if [ -n "$host" ] && [ "$here" -eq 0 ]; then
   deploy_remote "$host"

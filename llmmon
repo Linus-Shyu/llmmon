@@ -1355,6 +1355,7 @@ llmmon  在这台 Mac 的 Terminal 里看另一台 Mac 上的模型
   llmmon user@mac             直接指定那台机器，同时显示这台 MacBook
   llmmon --local              只监控本机
   llmmon --once               打一行就退出
+  ./install.sh --url https://… --token …   看一台已经开了隧道的 Mac
   ./install.sh user@mac       装到本机，并装到那台机器
 
 按键
