@@ -543,8 +543,22 @@ def fence_calls(source: str) -> list[dict]:
     return found
 
 
+def user_text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("text"):
+                parts.append(str(item.get("text") or ""))
+        return "\n".join(parts)
+    return str(content or "")
+
+
 def last_user() -> str:
-    return getattr(_ctx, "user", "") or ""
+    return user_text_of(getattr(_ctx, "user", "") or "")
 
 
 FOLDER_ASK = re.compile(
@@ -573,35 +587,62 @@ FOLDER_SKIP = {
     "并且",
     "再",
 }
-NAME_NOISE = re.compile(r"写|页面|html|代码|脚本|游戏|然后|并且")
+NAME_NOISE = re.compile(r"写|页面|html|代码|脚本|游戏|然后|并且|帮我|请|一下|桌面|建立|创建|新建|名为|叫做|的|の")
 
 
 def is_folder_request(text: str) -> bool:
-    return bool(FOLDER_ASK.search(text or ""))
+    return bool(FOLDER_ASK.search(user_text_of(text)))
 
 
 def is_folder_only(text: str) -> bool:
-    return is_folder_request(text) and not FILE_ASK.search(text or "")
+    text = user_text_of(text)
+    return is_folder_request(text) and not FILE_ASK.search(text)
+
+
+def folder_root(user_text: str) -> str:
+    if re.search(r"桌面|Desktop", user_text or "", re.I):
+        desktop = os.path.join(HOME, "Desktop")
+        if os.path.isdir(desktop):
+            return desktop
+    return work_dir()
+
+
+def looks_like_folder_name(name: str) -> bool:
+    name = (name or "").strip()
+    if not name or name.lower() in FOLDER_SKIP:
+        return False
+    if NAME_NOISE.search(name) or len(name) > 40:
+        return False
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]{0,40}", name):
+        return True
+    if re.fullmatch(r"[\u4e00-\u9fff]{1,8}", name):
+        return True
+    return False
 
 
 def folder_path(user_text: str) -> str:
-    root = work_dir()
-    patterns = (
-        r"(?:文件夹|目录|folder)\s*(?:叫做|名叫|命名为|名为|叫)?\s*[「『\"'`]?([A-Za-z0-9._\-\u4e00-\u9fff]+)",
-        r"(?:创建|新建|建一个|建个|做一个|开一个)\s*(?:一个)?(?:叫做|名叫|名为|叫)?\s*[「『\"'`]?([A-Za-z0-9._\-\u4e00-\u9fff]+)[」『\"'`]?\s*(?:的)?(?:文件夹|目录|folder)",
-        r"([A-Za-z0-9._\-\u4e00-\u9fff]+)\s*(?:这个)?(?:文件夹|目录|folder)",
-        r"(?:叫做|名叫|命名为|名为|叫)\s*[「『\"'`]?([A-Za-z0-9._\-\u4e00-\u9fff]+)",
-        r"[「『\"'`]([A-Za-z0-9._\-\u4e00-\u9fff]+)[」』\"'`]",
-        r"(?:mkdir\s+-p\s+|mkdir\s+)([~\w./-]+)",
-        r"((?:/Users/[^/\s]+/|~/|Desktop/)[\w./-]+)",
-    )
-    for pat in patterns:
-        for match in re.finditer(pat, user_text or "", re.I):
-            name = match.group(1)
-            if not name or name.lower() in FOLDER_SKIP or NAME_NOISE.search(name) or name.startswith(("新建", "创建", "建个", "建一")):
-                continue
-            if name.startswith("~") or name.startswith("/"):
-                return ground_text(os.path.expanduser(name))
+    text = user_text_of(user_text)
+    root = folder_root(text)
+    candidates: list[str] = []
+    for match in re.finditer(r"(?:名为|叫做|名叫|叫|name(?:d)?)\s*[「『\"'`]?([A-Za-z][A-Za-z0-9._-]{0,40}|[\u4e00-\u9fff]{1,8})", text, re.I):
+        candidates.append(match.group(1))
+    for match in re.finditer(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9._-]{0,40})\s*(?:文件夹|目录|folder)", text, re.I):
+        candidates.append(match.group(1))
+    for match in re.finditer(r"[「『\"'`]([^「『\"'`]{1,40})[」』\"'`]", text):
+        candidates.append(match.group(1))
+    for match in re.finditer(r"mkdir(?:\s+-p)?\s+([~\w./-]+)", text, re.I):
+        raw = match.group(1)
+        if raw.startswith("~") or raw.startswith("/"):
+            return ground_text(os.path.expanduser(raw))
+        candidates.append(os.path.basename(raw))
+    # last latin token before 文件夹, e.g. 建立一个test文件夹
+    for match in re.finditer(r"([A-Za-z][A-Za-z0-9._-]{0,40})(?=\s*(?:的)?(?:文件夹|目录|folder)\b)", text, re.I):
+        candidates.append(match.group(1))
+    if re.search(r"(?:文件夹|目录|folder)", text, re.I):
+        for match in re.finditer(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9._-]{0,40})(?![A-Za-z0-9])", text):
+            candidates.append(match.group(1))
+    for name in candidates:
+        if looks_like_folder_name(name):
             return os.path.join(root, name)
     return ""
 
@@ -738,7 +779,7 @@ def correct_calls(calls: list[dict]) -> list[dict]:
         content = args.get("content") if args.get("content") is not None else args.get("contents")
         content_s = content if isinstance(content, str) else ""
         if folder and name == "write":
-            dest = path or folder_path(user)
+            dest = folder_path(user)
             if dest:
                 try:
                     os.makedirs(dest, exist_ok=True)
@@ -800,14 +841,20 @@ def file_path(name: str, lang: str, body: str, user_text: str) -> str:
 
 
 def wants_run(user_text: str) -> bool:
-    return bool(re.search(r"运行|跑起来|打开|执行|open|run|launch|play", user_text or "", re.I))
+    return bool(re.search(r"运行|跑起来|执行|浏览器|打开页面|open|run|launch|play", user_text or "", re.I))
+
+
+def wants_page(user_text: str) -> bool:
+    return bool(FILE_ASK.search(user_text or ""))
 
 
 def run_calls(path: str, lang: str, user_text: str) -> list[dict]:
     lang = (lang or "").lower()
     quoted = shlex.quote(path)
     if lang in ("html", "htm") or path.endswith((".html", ".htm")):
-        return [{"name": "bash", "arguments": {"command": f"open {quoted}"}}]
+        if wants_run(user_text) or wants_page(user_text):
+            return [{"name": "bash", "arguments": {"command": f"open {quoted}"}}]
+        return []
     if lang in ("python", "py") or path.endswith(".py"):
         if wants_run(user_text):
             return [{"name": "bash", "arguments": {"command": f"python3 {quoted}"}}]
@@ -816,6 +863,8 @@ def run_calls(path: str, lang: str, user_text: str) -> list[dict]:
 
 def file_calls(source: str) -> list[dict]:
     user_text = last_user()
+    if is_folder_only(user_text) or not wants_page(user_text):
+        return []
     found = []
     seen = set()
     for match in FILE_FENCE.finditer(source or ""):
@@ -947,7 +996,7 @@ def prepare(body: bytes) -> bytes:
     user_text = ""
     for message in reversed(trimmed):
         if message.get("role") == "user":
-            user_text = message.get("content") or ""
+            user_text = user_text_of(message.get("content"))
             break
     _ctx.user = user_text
     tools = incoming.get("tools")
