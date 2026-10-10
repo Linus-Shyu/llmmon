@@ -51,7 +51,9 @@ minicode    # 在当前目录里让模型改文件、跑命令
 
 如果 `~/.config/fastfetch/linus_art.txt` 存在，那些行画在标题上面。没有这个文件就从标题开始。
 
-`minicode` 是终端里的会话，不是从访达打开的应用。它调用本机的 OpenCode，模型地址走本机 `127.0.0.1:11436` 的代理。改文件或跑命令之前会问你。用 `Ctrl+C` 离开。系统自带的「终端」画这个界面会崩溃（CoreText 字体回退里的 `EXC_ARM_PAC_FAIL`）。装了 Warp 时，`minicode` 会改到 Warp 里打开。否则用 iTerm 或 Warp。
+`minicode` 是终端里的会话，不是从访达打开的应用。它调用本机的 OpenCode，模型地址走本机 `127.0.0.1:11436` 的代理。让它写文件或打开页面时，它会自己落盘并运行，不要只把代码贴在对话里。每次启动会把当前目录、OpenCode 权限和代理更新到这一版。改文件或跑命令之前会问你。用 `Ctrl+C` 离开。系统自带的「终端」画这个界面会崩溃（CoreText 字体回退里的 `EXC_ARM_PAC_FAIL`）。装了 Warp 时，`minicode` 会改到 Warp 里打开。否则用 iTerm 或 Warp。
+
+已经装过的机器用 `./install.sh --client` 对齐这一版。本机和另一台写代码的 Mac 都要跑一次，旧的 `execute: deny` 会被拿掉。
 
 ![minicode](docs/minicode.png)
 
@@ -70,7 +72,7 @@ minicode    # 在当前目录里让模型改文件、跑命令
 
 12–23GB 的机器用 7B。这个大小放得下，还留得下系统和 16384 的上下文。在这台机器上装 14B 或 32B 会被推进交换分区。
 
-写给 OpenCode 的配置不加载已安装的技能、网页搜索和子代理。7B 模型读这些说明就要花掉几千 token，每一轮还没写代码就先把时间耗在读说明上。新开会话用短提示。已经开着的会话要退出再开，才会换上新提示。已经存在的 `~/.config/opencode/opencode.json` 不会被覆盖。
+写给 OpenCode 的配置不加载已安装的技能、网页搜索和子代理。7B 模型读这些说明就要花掉几千 token，每一轮还没写代码就先把时间耗在读说明上。新开会话用短提示。已经开着的会话要退出再开，才会换上新提示。`setup-coder --apply` 会改已有的 `~/.config/opencode/opencode.json`：打开写文件和跑命令、加长输出、换上短提示。其它自定义项会留下。
 
 OpenCode 本体不改。安装的是 Homebrew 里的 `anomalyco/tap/opencode-v2`。
 
@@ -79,14 +81,14 @@ OpenCode 本体不改。安装的是 Homebrew 里的 `anomalyco/tap/opencode-v2`
 | 文件 | 作用 |
 | --- | --- |
 | `llmmon` | 终端监控。`--local` 看本机，`--serve` 从标准输出送状态，`--serve-http` 在 `127.0.0.1:11437` 提供 `/snapshot` |
-| `install.sh` | 一行安装的入口。`--server` 装模型那台，`--url` 装看画面那台 |
-| `setup-coder` | 按内存装 `coder`，并接上 OpenCode |
-| `minicode` | 启动 OpenCode，模型走本机代理 |
-| `minicode-proxy.py` | 把小模型吐出的普通 JSON 工具调用，转成 OpenCode 要的 `tool_calls`。听 `127.0.0.1:11436` |
+| `install.sh` | 一行安装的入口。`--server` 装模型那台，`--url` 装看画面那台，`--client` 把本机工具更新到这一版 |
+| `setup-coder` | 按内存装 `coder`，并接上 OpenCode。`--apply` 只更新本机工具 |
+| `minicode` | 启动 OpenCode，模型走本机代理。每次启动会同步配置 |
+| `minicode-proxy.py` | 把小模型吐出的代码或 JSON 转成 `write` / `bash`，听 `127.0.0.1:11436` |
 | `tunnel.sh` | 在跑模型的 Mac 上用 cloudflared 往外开隧道 |
 | `serve.sh` | 防止睡眠，Ollama 空了就重新载入 `coder`，然后调用 `tunnel.sh` |
 
-看画面的那台 Mac 优先读 `~/.config/llmmon/url` 和 `~/.config/llmmon/token`，用 HTTPS 拉 `/snapshot`。没有这个地址时，才用 `~/.config/llmmon/host` 里的 `user@host` 走 SSH。环境变量 `LLMMON_URL`、`LLMMON_TOKEN`、`LLMMON_HOST` 可以盖过文件。
+看画面的那台 Mac 优先读 `~/.config/llmmon/url` 和 `~/.config/llmmon/token`，用 HTTPS 拉 `/snapshot`。没有这个地址时，才用 `~/.config/llmmon/host` 里的 `user@host` 走 SSH。环境变量 `LLMMON_URL`、`LLMMON_TOKEN`、`LLMMON_HOST` 可以盖过文件。再加一台机器写在 `~/.config/llmmon/peers`，每行 `标签 user@host`，画面底部会多一条状态带。
 
 模型地址写在 `~/.config/minicode/upstream`。代理先读这个文件，文件没有时才用启动项里的 `MINICODE_UPSTREAM`。
 
@@ -113,6 +115,7 @@ Ollama 留在 `127.0.0.1:11434`，不要直接开到局域网。另一台电脑�
 ```text
 ~/.config/llmmon/url
 ~/.config/llmmon/token
+~/.config/llmmon/peers          额外机器，每行 标签 user@host
 ~/.config/minicode/upstream
 ~/.config/minicode/proxy.py
 ~/.config/opencode/opencode.json

@@ -25,10 +25,12 @@ URL=""
 TOKEN=""
 UPSTREAM=""
 SERVER=0
+CLIENT=0
 HOST=""
 while [ $# -gt 0 ]; do
   case $1 in
     --server) SERVER=1; shift ;;
+    --client) CLIENT=1; shift ;;
     --url) URL=${2:-}; shift 2 ;;
     --token) TOKEN=${2:-}; shift 2 ;;
     --upstream) UPSTREAM=${2:-}; shift 2 ;;
@@ -41,6 +43,10 @@ while [ $# -gt 0 ]; do
 看画面、写代码的那台 Mac（地址由上面那条命令打印）：
 
   curl -fsSL https://raw.githubusercontent.com/Linus-Shyu/llmmon/main/install.sh | sh -s -- --url https://… --token … --upstream https://…
+
+已经装过、只要把本机和工具更新到仓库这一版：
+
+  ./install.sh --client
 
 需要本机已安装 Homebrew。
 EOF
@@ -80,6 +86,23 @@ cp "$ROOT/llmmon" "${HOME}/bin/llmmon"
 chmod 755 "${HOME}/bin/llmmon"
 link_bin llmmon
 
+refresh_client() {
+  if [ -f "$ROOT/minicode" ]; then
+    cp "$ROOT/minicode" "${HOME}/bin/minicode"
+    chmod 755 "${HOME}/bin/minicode"
+    link_bin minicode
+  fi
+  if [ -f "$ROOT/setup-coder" ]; then
+    sh "$ROOT/setup-coder" --apply
+  fi
+}
+
+if [ "$CLIENT" -eq 1 ]; then
+  refresh_client
+  echo "本机已更新。新开一个终端，运行:  llmmon   或  minicode"
+  exit 0
+fi
+
 if [ -n "$URL" ]; then
   printf '%s\n' "$URL" > "${HOME}/.config/llmmon/url"
   if [ -n "$TOKEN" ]; then
@@ -88,6 +111,8 @@ if [ -n "$URL" ]; then
   fi
   if [ -n "$UPSTREAM" ]; then
     sh "$ROOT/setup-coder" --upstream "$UPSTREAM"
+  else
+    refresh_client
   fi
   echo "装好了。新开一个终端，运行:  llmmon"
   exit 0

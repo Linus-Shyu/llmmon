@@ -9,6 +9,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin}"
 dry=0
 here=0
 model_only=0
+apply=0
 host=""
 upstream_url=""
 
@@ -19,6 +20,7 @@ usage() {
   ./setup-coder                 模型和工具都装在这台 Mac
   ./setup-coder user@mac        模型装在那台 Mac，并让它开隧道
   ./setup-coder --upstream URL  模型已经在这个地址上，只接本机工具
+  ./setup-coder --apply         更新本机 OpenCode、代理和 minicode，不重装模型
   ./setup-coder --dry-run       只打印会选哪个模型
 
 装完后，进入项目目录运行 minicode。
@@ -30,6 +32,7 @@ while [ $# -gt 0 ]; do
     --dry-run) dry=1; shift ;;
     --here) here=1; shift ;;
     --model-only) model_only=1; shift ;;
+    --apply) apply=1; shift ;;
     --upstream) upstream_url=${2:-}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *@*) host=$1; shift ;;
@@ -238,59 +241,102 @@ install_tunnel() {
   bootstrap_agent com.llmmon.minicode.tunnel "$plist"
 }
 
+INSTRUCTION='When the user asks you to create, change, or run a file, call write and then bash. Do not paste the file in chat. Do not tell the user to save or copy the code. Open an HTML page with bash: open and the absolute path. Run a Python file with python3 and the absolute path. Python is already installed as python3. Never install Python.'
+
 install_opencode() {
   if ! command -v opencode >/dev/null 2>&1; then
     brew install anomalyco/tap/opencode-v2
   fi
-  config=$HOME/.config/opencode/opencode.json
-  if [ -f "$config" ]; then
-    echo "已有 ${config}，没有覆盖。"
-    return 0
-  fi
   mkdir -p "$HOME/.config/opencode"
-  cat > "$config" << 'EOF'
-{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "mini/coder",
-  "skills": [],
-  "instructions": [
-    "When the user asks you to create, change, or run a file, call write and then shell. Do not describe the steps, and do not tell the user to paste the code. Python is already installed as python3. Never install Python."
-  ],
-  "permission": {
-    "skill": "deny",
-    "webfetch": "deny",
-    "websearch": "deny",
-    "subagent": "deny",
-    "question": "deny",
-    "execute": "deny"
-  },
-  "providers": {
-    "mini": {
-      "name": "Local coder",
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": {
-        "baseURL": "http://127.0.0.1:11436/v1",
-        "apiKey": "ollama"
-      },
-      "models": {
-        "coder": {
-          "modelID": "coder",
-          "name": "coder",
-          "capabilities": {
-            "tools": true,
-            "input": ["text"],
-            "output": ["text"]
-          },
-          "limit": {
-            "context": 16384,
-            "output": 2048
-          }
-        }
-      }
+  python3 - "$HOME/.config/opencode/opencode.json" "$INSTRUCTION" << 'PY'
+import json, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+instruction = sys.argv[2]
+data = {}
+if path.exists():
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+if not isinstance(data, dict):
+    data = {}
+data["$schema"] = "https://opencode.ai/config.json"
+data["model"] = data.get("model") or "mini/coder"
+data["skills"] = []
+data["instructions"] = [instruction]
+perm = data.get("permission") if isinstance(data.get("permission"), dict) else {}
+perm.pop("execute", None)
+perm.update(
+    {
+        "skill": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "subagent": "deny",
+        "question": "deny",
     }
-  }
+)
+data["permission"] = perm
+providers = data.get("providers") if isinstance(data.get("providers"), dict) else {}
+mini = providers.get("mini") if isinstance(providers.get("mini"), dict) else {}
+mini["name"] = mini.get("name") or "Local coder"
+mini["package"] = "@opencode/ai/providers/openai-compatible"
+settings = mini.get("settings") if isinstance(mini.get("settings"), dict) else {}
+settings["baseURL"] = "http://127.0.0.1:11436/v1"
+settings["apiKey"] = settings.get("apiKey") or "ollama"
+mini["settings"] = settings
+models = mini.get("models") if isinstance(mini.get("models"), dict) else {}
+coder = models.get("coder") if isinstance(models.get("coder"), dict) else {}
+coder["modelID"] = "coder"
+coder["name"] = coder.get("name") or "coder"
+caps = coder.get("capabilities") if isinstance(coder.get("capabilities"), dict) else {}
+caps["tools"] = True
+caps["input"] = ["text"]
+caps["output"] = ["text"]
+coder["capabilities"] = caps
+limit = coder.get("limit") if isinstance(coder.get("limit"), dict) else {}
+limit["context"] = max(int(limit.get("context") or 0), 16384)
+limit["output"] = max(int(limit.get("output") or 0), 8192)
+coder["limit"] = limit
+models["coder"] = coder
+mini["models"] = models
+providers["mini"] = mini
+data["providers"] = providers
+path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+PY
 }
-EOF
+
+stash_client_files() {
+  mkdir -p "$HOME/.config/minicode" "$HOME/bin"
+  for name in setup-coder minicode minicode-proxy.py llmmon; do
+    if [ -f "$ROOT/$name" ]; then
+      cp "$ROOT/$name" "$HOME/.config/minicode/$name"
+    fi
+  done
+}
+
+apply_client() {
+  stash_client_files
+  install_opencode
+  install_launcher
+  if [ -f "$ROOT/minicode-proxy.py" ]; then
+    if ! cmp -s "$ROOT/minicode-proxy.py" "$HOME/.config/minicode/proxy.py" 2>/dev/null; then
+      cp "$ROOT/minicode-proxy.py" "$HOME/.config/minicode/proxy.py"
+      chmod 755 "$HOME/.config/minicode/proxy.py"
+      if [ -f "$HOME/Library/LaunchAgents/com.llmmon.minicode.proxy.plist" ]; then
+        bootstrap_agent com.llmmon.minicode.proxy "$HOME/Library/LaunchAgents/com.llmmon.minicode.proxy.plist"
+      fi
+    fi
+  fi
+  if [ -f "$ROOT/llmmon" ]; then
+    mkdir -p "$HOME/bin"
+    cp "$ROOT/llmmon" "$HOME/bin/llmmon"
+    chmod 755 "$HOME/bin/llmmon"
+    if [ -w /opt/homebrew/bin ]; then
+      ln -sfn "$HOME/bin/llmmon" /opt/homebrew/bin/llmmon
+    fi
+  fi
 }
 
 install_launcher() {
@@ -315,6 +361,7 @@ install_launcher() {
 install_tools() {
   upstream=$1
   remote=${2:-}
+  stash_client_files
   install_opencode
   if [ -n "$remote" ]; then
     install_tunnel "$remote"
@@ -361,6 +408,12 @@ deploy_remote() {
     "$ROOT/install.sh" "$remote"
   fi
 }
+
+if [ "$apply" -eq 1 ]; then
+  apply_client
+  echo "本机 minicode 已更新。进入项目目录后运行: minicode"
+  exit 0
+fi
 
 if [ -n "$upstream_url" ]; then
   install_tools "$upstream_url"

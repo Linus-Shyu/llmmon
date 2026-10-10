@@ -66,6 +66,10 @@ start_agent() {
 }
 
 mkdir -p "$HOME/.config/minicode"
+printf '%s\n' "$(pwd)" > "$HOME/.config/minicode/cwd"
+if [ -x "$HOME/.config/minicode/setup-coder" ]; then
+  sh "$HOME/.config/minicode/setup-coder" --apply >/dev/null 2>&1 || true
+fi
 if [ ! -s "$upstream_file" ]; then
   echo "把模型地址写进 $upstream_file" >&2
   exit 1
@@ -75,13 +79,13 @@ start_agent com.llmmon.minicode.proxy
 
 ready=0
 i=0
-while [ "$i" -lt 20 ]; do
-  if curl -sf -m 1 http://127.0.0.1:11436/v1/models >/dev/null 2>&1; then
+while [ "$i" -lt 8 ]; do
+  if curl -sf -m 8 http://127.0.0.1:11436/v1/models >/dev/null 2>&1; then
     ready=1
     break
   fi
   i=$((i + 1))
-  sleep 0.4
+  sleep 0.5
 done
 
 if [ "$ready" -ne 1 ]; then

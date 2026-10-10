@@ -27,6 +27,8 @@ INTERVAL = 0.20
 OLLAMA = "http://127.0.0.1:11434"
 
 CHIPS = {
+    "MacBookAir10,1": "M1",
+    "Macmini9,1": "M1",
     "Mac14,3": "M2",
     "Mac14,12": "M2 Pro",
     "Mac15,4": "M3",
@@ -217,12 +219,16 @@ def vm_stat() -> VMStat | None:
     return vm if kr == 0 else None
 
 
-def swap_used() -> int:
+def swap_info() -> tuple[int, int, int]:
     usage = SwapUsage()
     size = ctypes.c_size_t(ctypes.sizeof(usage))
     if libc.sysctlbyname(b"vm.swapusage", byref(usage), byref(size), None, 0) != 0:
-        return 0
-    return int(usage.used)
+        return 0, 0, 0
+    return int(usage.used), int(usage.total), int(usage.avail)
+
+
+def swap_used() -> int:
+    return swap_info()[0]
 
 
 def list_pids() -> list[int]:
@@ -265,6 +271,15 @@ def fmt_bytes(n: float) -> str:
 
 def fmt_rate(n: float) -> str:
     return fmt_bytes(n) + "/s"
+
+
+def fmt_qps(n: float) -> str:
+    n = max(0.0, float(n))
+    if n >= 1000:
+        return f"{n / 1000:.1f}k/s"
+    if n >= 10:
+        return f"{n:.0f}/s"
+    return f"{n:.1f}/s"
 
 
 def bar(pct: float, width: int) -> str:
@@ -366,14 +381,22 @@ def machine_info() -> dict:
     page = sysctl_u64("hw.pagesize") or 16384
     p_cores = sysctl_u32("hw.perflevel0.physicalcpu") or 0
     e_cores = sysctl_u32("hw.perflevel1.physicalcpu") or 0
+    ncpu = sysctl_u32("hw.logicalcpu") or sysctl_u32("hw.ncpu") or (p_cores + e_cores)
+    physical = sysctl_u32("hw.physicalcpu") or (p_cores + e_cores)
     return {
         "host": socket.gethostname().split(".")[0],
         "model_id": model,
         "chip": CHIPS.get(model, model),
+        "brand": sysctl_str("machdep.cpu.brand_string") or CHIPS.get(model, model),
+        "os": sysctl_str("kern.osproductversion"),
+        "build": sysctl_str("kern.osversion"),
+        "kernel": sysctl_str("kern.osrelease"),
         "mem_total": total,
         "page": page,
         "p_cores": p_cores,
         "e_cores": e_cores,
+        "ncpu": ncpu,
+        "physicalcpu": physical,
         "boot": boot_sec(),
     }
 
@@ -405,6 +428,9 @@ class Engine:
         self._scan_t = 0.0
         self._proc_prev: dict[int, tuple[float, int]] = {}
         self._net_prev: tuple[float, int, int] | None = None
+        self._vm_prev: tuple[float, tuple[int, ...]] | None = None
+        self._tunnel = False
+        self._procs = 0
         self._bench_on = False
         threading.Thread(target=self._slow, name="llmmon-slow", daemon=True).start()
 
@@ -473,18 +499,32 @@ class Engine:
                     self.extra["tx"] = tx
             self._stop.wait(0.45)
 
+    def _ollama_version(self) -> str:
+        try:
+            with urllib.request.urlopen(OLLAMA + "/api/version", timeout=0.25) as resp:
+                return str(json.loads(resp.read().decode()).get("version") or "")
+        except Exception:
+            return ""
+
     def _fetch_ollama(self) -> dict:
+        version = self._ollama_version()
         try:
             with urllib.request.urlopen(OLLAMA + "/api/ps", timeout=0.25) as resp:
                 payload = json.loads(resp.read().decode())
         except Exception:
-            return {"ollama_up": False}
+            return {"ollama_up": False, "ollama_version": version, "models": [], "loaded": 0, "model_size": 0}
         models = payload.get("models") or []
+        names = [item.get("name") or item.get("model") or "" for item in models]
+        names = [name for name in names if name]
         if not models:
             name = self._first_tag()
             return {
                 "ollama_up": True,
+                "ollama_version": version,
                 "model": name,
+                "models": [name] if name else [],
+                "loaded": 0,
+                "model_size": 0,
                 "quant": "",
                 "params": "",
                 "vram": 0,
@@ -496,7 +536,11 @@ class Engine:
         details = model.get("details") or {}
         return {
             "ollama_up": True,
+            "ollama_version": version,
             "model": model.get("name") or model.get("model") or "",
+            "models": names,
+            "loaded": len(models),
+            "model_size": int(model.get("size") or 0),
             "quant": details.get("quantization_level") or "",
             "params": details.get("parameter_size") or "",
             "vram": int(model.get("size_vram") or model.get("size") or 0),
@@ -552,11 +596,17 @@ class Engine:
             return
         self._scan_t = now
         found = []
-        for pid in list_pids():
-            name = proc_name(pid)
-            if "ollama" in name.lower():
+        tunnel = False
+        pids = list_pids()
+        self._procs = len(pids)
+        for pid in pids:
+            name = proc_name(pid).lower()
+            if "ollama" in name:
                 found.append(pid)
+            if "cloudflared" in name:
+                tunnel = True
         self._tracked = found
+        self._tunnel = tunnel
 
     def snapshot(self) -> dict:
         started = time.perf_counter()
@@ -588,6 +638,8 @@ class Engine:
         vm = vm_stat()
         page = self.info["page"]
         mem_used = wired = compressed = active = inactive = free = 0
+        purgeable = speculative = 0
+        pagein_s = pageout_s = fault_s = compress_s = decompress_s = swapin_s = swapout_s = 0.0
         if vm is not None:
             internal = max(0, int(vm.internal_page_count) - int(vm.purgeable_count))
             mem_used = (internal + int(vm.wire_count) + int(vm.compressor_page_count)) * page
@@ -596,9 +648,32 @@ class Engine:
             active = int(vm.active_count) * page
             inactive = int(vm.inactive_count) * page
             free = int(vm.free_count) * page
+            purgeable = int(vm.purgeable_count) * page
+            speculative = int(vm.speculative_count) * page
+            cur_vm = (
+                int(vm.pageins),
+                int(vm.pageouts),
+                int(vm.faults),
+                int(vm.compressions),
+                int(vm.decompressions),
+                int(vm.swapins),
+                int(vm.swapouts),
+            )
+            if self._vm_prev:
+                prev_t, prev_vm = self._vm_prev
+                dt = max(now - prev_t, 0.001)
+                pagein_s = max(0.0, (cur_vm[0] - prev_vm[0]) / dt)
+                pageout_s = max(0.0, (cur_vm[1] - prev_vm[1]) / dt)
+                fault_s = max(0.0, (cur_vm[2] - prev_vm[2]) / dt)
+                compress_s = max(0.0, (cur_vm[3] - prev_vm[3]) / dt)
+                decompress_s = max(0.0, (cur_vm[4] - prev_vm[4]) / dt)
+                swapin_s = max(0.0, (cur_vm[5] - prev_vm[5]) / dt)
+                swapout_s = max(0.0, (cur_vm[6] - prev_vm[6]) / dt)
+            self._vm_prev = (now, cur_vm)
         total = self.info["mem_total"]
         if total and mem_used > total:
             mem_used = total
+        swap_used_n, swap_total, swap_avail = swap_info()
 
         self._scan_runners(now)
         runner_cpu = 0.0
@@ -634,7 +709,13 @@ class Engine:
         snap = {
             "host": self.info["host"],
             "chip": self.info["chip"],
+            "brand": self.info.get("brand") or self.info["chip"],
             "model_id": self.info["model_id"],
+            "os": self.info.get("os") or "",
+            "build": self.info.get("build") or "",
+            "kernel": self.info.get("kernel") or "",
+            "ncpu": self.info.get("ncpu") or 0,
+            "physicalcpu": self.info.get("physicalcpu") or 0,
             "mem_total": total,
             "cpu": round(cpu, 1),
             "cpu_p": round(cpu_p, 1),
@@ -650,13 +731,26 @@ class Engine:
             "active": active,
             "inactive": inactive,
             "free": free,
-            "swap": swap_used(),
+            "purgeable": purgeable,
+            "speculative": speculative,
+            "swap": swap_used_n,
+            "swap_total": swap_total,
+            "swap_avail": swap_avail,
+            "pagein_s": round(pagein_s, 1),
+            "pageout_s": round(pageout_s, 1),
+            "fault_s": round(fault_s, 1),
+            "compress_s": round(compress_s, 1),
+            "decompress_s": round(decompress_s, 1),
+            "swapin_s": round(swapin_s, 1),
+            "swapout_s": round(swapout_s, 1),
             "disk_total": disk_total,
             "disk_free": disk_free,
             "disk_used": disk_used,
             "runner_cpu": round(runner_cpu, 1),
             "runner_rss": runner_rss,
             "runner_threads": runner_threads,
+            "procs": self._procs,
+            "cloudflared": self._tunnel,
             "busy": busy,
             "sample_us": round((time.perf_counter() - started) * 1e6, 1),
         }
@@ -904,8 +998,15 @@ def _plain(text: str) -> str:
     return "".join(out)
 
 
+def _load3(snap: dict) -> list[float]:
+    load = list(snap.get("load") or [0, 0, 0])
+    while len(load) < 3:
+        load.append(0)
+    return load
+
+
 def machine_band(label: str, snap: dict | None, *, inner: int) -> list[str]:
-    bar_w = max(10, min(24, inner // 5))
+    bar_w = max(10, min(28, inner // 4))
     if not snap:
         return [pad(f" {AMBER}{label}{RST}  {DIM}waiting{RST}", inner)]
     model = snap.get("model") or "no model"
@@ -916,28 +1017,80 @@ def machine_band(label: str, snap: dict | None, *, inner: int) -> list[str]:
     mem_total = float(snap.get("mem_total") or 1)
     mem_used = float(snap.get("mem_used") or 0)
     mem_pct = 100.0 * mem_used / mem_total if mem_total else 0
+    wired = float(snap.get("wired") or 0)
+    compressed = float(snap.get("compressed") or 0)
+    app = max(0.0, mem_used - wired - compressed)
+    free_b = max(0.0, mem_total - mem_used)
     disk_total = float(snap.get("disk_total") or 0)
     disk_used = float(snap.get("disk_used") or 0)
+    disk_free = float(snap.get("disk_free") or 0)
     disk_pct = 100.0 * disk_used / disk_total if disk_total else 0
-    return [
+    load = _load3(snap)
+    p_n = int(snap.get("p_cores") or 0)
+    e_n = int(snap.get("e_cores") or 0)
+    ncpu = int(snap.get("ncpu") or p_n + e_n)
+    os_v = snap.get("os") or ""
+    build = snap.get("build") or ""
+    brand = snap.get("brand") or snap.get("chip") or ""
+    swap_used_n = float(snap.get("swap") or 0)
+    swap_total = float(snap.get("swap_total") or 0)
+    swap_txt = (
+        f"{fmt_bytes(swap_used_n)}/{fmt_bytes(swap_total)}"
+        if swap_total
+        else fmt_bytes(swap_used_n)
+    )
+    cores = snap.get("cores") or []
+    lines = [
         pad(
-            f" {AMBER}{label}{RST}  {INK}{snap.get('host', '')}{RST}  {CYAN}{snap.get('chip', '')}{RST}"
-            f"  {INK}{model}{RST}  {state_color}{state}{RST}  {ollama}",
+            f" {AMBER}{label}{RST}  {INK}{snap.get('host', '')}{RST}  {CYAN}{brand}{RST}"
+            f"  {DIM}{snap.get('model_id', '')}{RST}  {fmt_bytes(mem_total)}"
+            f"  {DIM}macOS {os_v} {build}  {ncpu} thr {p_n}P+{e_n}E  up {fmt_uptime(float(snap.get('uptime') or 0))}{RST}",
+            inner,
+        ),
+        pad(
+            f" {AMBER}MODEL{RST}  {INK}{model}{RST}  {DIM}{snap.get('family') or ''} {snap.get('params') or ''} {snap.get('quant') or ''}{RST}"
+            f"  {state_color}{state}{RST}  {ollama}"
+            f"  {DIM}{snap.get('ollama_version') or ''}{RST}",
             inner,
         ),
         pad(
             f" {AMBER}CPU{RST}    {tone(cpu)}{cpu:5.1f}%{RST} {bar(cpu, bar_w)}"
-            f"   {AMBER}MEM{RST} {INK}{fmt_bytes(mem_used)}{RST}/{fmt_bytes(mem_total)}"
-            f" {tone(mem_pct)}{mem_pct:3.0f}%{RST}",
-            inner,
-        ),
-        pad(
-            f" {AMBER}DISK{RST}   {INK}{fmt_bytes(disk_used)}{RST}/{fmt_bytes(disk_total)}"
-            f" {tone(disk_pct)}{disk_pct:3.0f}%{RST}"
-            f"   {DIM}free {fmt_bytes(snap.get('disk_free') or 0)}  swap {fmt_bytes(snap.get('swap') or 0)}{RST}",
+            f"  {DIM}P {float(snap.get('cpu_p') or 0):4.0f}%  E {float(snap.get('cpu_e') or 0):4.0f}%{RST}"
+            f"  {DIM}load {load[0]:.2f}  {load[1]:.2f}  {load[2]:.2f}{RST}",
             inner,
         ),
     ]
+    if cores:
+        lines.append(pad(f"        {core_row(cores, p_n, e_n)}", inner))
+    lines.extend(
+        [
+            pad(
+                f" {AMBER}MEM{RST}    {INK}{fmt_bytes(mem_used)}{RST}/{fmt_bytes(mem_total)} {bar(mem_pct, bar_w)} {tone(mem_pct)}{mem_pct:3.0f}%{RST}"
+                f"  {DIM}app {fmt_bytes(app)}  wire {fmt_bytes(wired)}  comp {fmt_bytes(compressed)}  free {fmt_bytes(free_b)}{RST}",
+                inner,
+            ),
+            pad(
+                f"        {stack_bar([(app, GREEN), (wired, CYAN), (compressed, AMBER), (free_b, DIM)], bar_w)}"
+                f"  {DIM}active {fmt_bytes(snap.get('active') or 0)}  inactive {fmt_bytes(snap.get('inactive') or 0)}"
+                f"  swap {swap_txt}{RST}",
+                inner,
+            ),
+            pad(
+                f" {AMBER}DISK{RST}   {INK}{fmt_bytes(disk_used)}{RST}/{fmt_bytes(disk_total)} {bar(disk_pct, bar_w)} {tone(disk_pct)}{disk_pct:3.0f}%{RST}"
+                f"  {DIM}free {fmt_bytes(disk_free)}{RST}"
+                f"   {AMBER}NET{RST} {CYAN}{fmt_rate(snap.get('rx') or 0)}{RST} {DIM}down{RST}  {CYAN}{fmt_rate(snap.get('tx') or 0)}{RST} {DIM}up{RST}",
+                inner,
+            ),
+            pad(
+                f" {AMBER}RUN{RST}    rss {CYAN}{fmt_bytes(snap.get('runner_rss') or 0)}{RST}"
+                f"  cpu {tone(float(snap.get('runner_cpu') or 0))}{float(snap.get('runner_cpu') or 0):5.1f}%{RST}"
+                f"  {DIM}threads {snap.get('runner_threads') or 0}  procs {snap.get('procs') or 0}"
+                f"  sample {snap.get('sample_us') or 0:.0f}us{RST}",
+                inner,
+            ),
+        ]
+    )
+    return lines
 
 
 def render(
@@ -950,6 +1103,7 @@ def render(
     cols: int,
     spin: int,
     local_snap: dict | None = None,
+    extra_snaps: list[tuple[str, dict | None]] | None = None,
 ) -> bytes:
     cols = max(72, cols)
     inner = cols - 2
@@ -958,8 +1112,9 @@ def render(
     title = f" {BOLD}{AMBER}LLMMON{RST}  {AMBER}{who}{RST}  "
     if snap:
         title += (
-            f"{INK}{snap.get('host', '')}{RST}  {CYAN}{snap.get('chip', '')}{RST}"
+            f"{INK}{snap.get('host', '')}{RST}  {CYAN}{snap.get('brand') or snap.get('chip', '')}{RST}"
             f"  {DIM}{snap.get('model_id', '')}{RST}  {fmt_bytes(snap.get('mem_total') or 0)}"
+            f"  {DIM}macOS {snap.get('os') or ''} {snap.get('build') or ''}{RST}"
         )
     else:
         title += f"{DIM}waiting{RST}"
@@ -985,6 +1140,10 @@ def render(
         if local_snap is not None:
             lines.append(f" {DIM}{'─' * max(8, inner - 2)}{RST}")
             lines.extend(machine_band("MACBOOK", local_snap, inner=inner))
+            lines.append("")
+        for label, extra in extra_snaps or []:
+            lines.append(f" {DIM}{'─' * max(8, inner - 2)}{RST}")
+            lines.extend(machine_band(label, extra, inner=inner))
             lines.append("")
         lines.append(f" {DIM}q quit{RST}")
         return frame(lines)
@@ -1037,6 +1196,42 @@ def render(
     else:
         bench = f"{DIM}press b to measure tok/s{RST}"
     lines.append(pad(f"        {bench}", inner))
+
+    p_n = int(snap.get("p_cores") or 0)
+    e_n = int(snap.get("e_cores") or 0)
+    ncpu = int(snap.get("ncpu") or p_n + e_n)
+    tunnel = f"{GREEN}up{RST}" if snap.get("cloudflared") else f"{RED}down{RST}"
+    loaded = snap.get("models") or ([snap.get("model")] if snap.get("model") else [])
+    loaded = [name for name in loaded if name]
+    loaded_s = "  ".join(loaded) if loaded else "none loaded"
+    lines.append(
+        pad(
+            f" {AMBER}OS{RST}     {INK}macOS {snap.get('os') or '—'}{RST}  {DIM}{snap.get('build') or ''}"
+            f"  Darwin {snap.get('kernel') or ''}{RST}  {CYAN}{snap.get('brand') or snap.get('chip') or ''}{RST}"
+            f"  {DIM}{ncpu} thr  {p_n}P+{e_n}E  {int(snap.get('physicalcpu') or p_n + e_n)} cpu"
+            f"  procs {snap.get('procs') or 0}{RST}",
+            inner,
+        )
+    )
+    lines.append(
+        pad(
+            f" {AMBER}PAGE{RST}   {DIM}in {fmt_qps(snap.get('pagein_s') or 0)}"
+            f"  out {fmt_qps(snap.get('pageout_s') or 0)}"
+            f"  fault {fmt_qps(snap.get('fault_s') or 0)}"
+            f"  compress {fmt_qps(snap.get('compress_s') or 0)}"
+            f"  decompress {fmt_qps(snap.get('decompress_s') or 0)}{RST}",
+            inner,
+        )
+    )
+    lines.append(
+        pad(
+            f" {AMBER}OLLAMA{RST} {INK}{snap.get('ollama_version') or '—'}{RST}  {ollama}"
+            f"  {DIM}loaded {snap.get('loaded') or 0}  {loaded_s}{RST}"
+            f"  {DIM}size {fmt_bytes(snap.get('model_size') or 0)}{RST}"
+            f"   {AMBER}TUNNEL{RST} {tunnel}",
+            inner,
+        )
+    )
 
     cpu = float(snap.get("cpu") or 0)
     p_txt = f"P {snap.get('cpu_p', 0):4.0f}%" if snap.get("p_cores") else ""
@@ -1091,9 +1286,20 @@ def render(
             inner,
         )
     )
+    swap_used_n = float(snap.get("swap") or 0)
+    swap_total = float(snap.get("swap_total") or 0)
+    swap_avail = float(snap.get("swap_avail") or 0)
+    swap_txt = (
+        f"{fmt_bytes(swap_used_n)}/{fmt_bytes(swap_total)}"
+        if swap_total
+        else fmt_bytes(swap_used_n)
+    )
     lines.append(
         pad(
-            f"        {DIM}active {fmt_bytes(snap.get('active') or 0)}   inactive {fmt_bytes(snap.get('inactive') or 0)}   swap {fmt_bytes(snap.get('swap') or 0)}{RST}",
+            f"        {DIM}active {fmt_bytes(snap.get('active') or 0)}   inactive {fmt_bytes(snap.get('inactive') or 0)}"
+            f"   purge {fmt_bytes(snap.get('purgeable') or 0)}   spec {fmt_bytes(snap.get('speculative') or 0)}"
+            f"   swap {swap_txt}  avail {fmt_bytes(swap_avail)}"
+            f"   in {fmt_qps(snap.get('swapin_s') or 0)}  out {fmt_qps(snap.get('swapout_s') or 0)}{RST}",
             inner,
         )
     )
@@ -1126,6 +1332,9 @@ def render(
     if local_snap is not None:
         lines.append(f" {DIM}{'─' * max(8, inner - 2)}{RST}")
         lines.extend(machine_band("MACBOOK", local_snap, inner=inner))
+    for label, extra in extra_snaps or []:
+        lines.append(f" {DIM}{'─' * max(8, inner - 2)}{RST}")
+        lines.extend(machine_band(label, extra, inner=inner))
 
     age_s = "—" if age > 90 else f"{age:.2f}s"
     age_color = GREEN if age < 0.5 else AMBER if age < 1.5 else RED
@@ -1140,12 +1349,13 @@ def render(
     return frame(lines)
 
 
-def run_tui(source, link: str, local=None) -> None:
+def run_tui(source, link: str, local=None, extras=None) -> None:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setcbreak(fd)
     sys.stdout.write("\033[?1049h\033[?25l\033[?7l")
     sys.stdout.flush()
+    extras = extras or []
     paused = False
     frozen = None
     hist_cpu: list[float] = []
@@ -1181,6 +1391,7 @@ def run_tui(source, link: str, local=None) -> None:
                 if paused:
                     frozen = (snap, status, age, _err)
             local_snap = local.snapshot() if local is not None else None
+            extra_snaps = [(label, view.latest()[0]) for label, view in extras]
             cols = os.get_terminal_size().columns
             sys.stdout.buffer.write(
                 render(
@@ -1192,6 +1403,7 @@ def run_tui(source, link: str, local=None) -> None:
                     cols=cols,
                     spin=spin,
                     local_snap=local_snap,
+                    extra_snaps=extra_snaps,
                 )
             )
             sys.stdout.flush()
@@ -1203,6 +1415,8 @@ def run_tui(source, link: str, local=None) -> None:
         source.stop()
         if local is not None:
             local.stop()
+        for _label, view in extras:
+            view.stop()
 
 
 def print_once(snap: dict) -> None:
@@ -1375,6 +1589,7 @@ llmmon  在这台 Mac 的 Terminal 里看另一台 Mac 上的模型
 
 配置文件只有一行，例如 user@192.168.1.20
 也可以用环境变量 LLMMON_HOST。
+再加一台机器写在 ~/.config/llmmon/peers，每行 `标签 user@host`。
 """
 
 
@@ -1409,6 +1624,44 @@ def host_from_config() -> str:
     return ""
 
 
+def extra_peers() -> list[tuple[str, str]]:
+    env = os.environ.get("LLMMON_PEERS", "").strip()
+    text = env.replace(",", "\n") if env else ""
+    if not text:
+        path = os.path.expanduser("~/.config/llmmon/peers")
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            return []
+    peers: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) == 1:
+            host = parts[0]
+            name = host.split("@", 1)[-1]
+            label = name.split(".")[0].upper()[:12] or "PEER"
+        else:
+            label, host = parts[0], parts[1]
+        if host in seen:
+            continue
+        seen.add(host)
+        peers.append((label, host))
+    return peers
+
+
+def extra_views(skip_host: str = "") -> list[tuple[str, RemoteView]]:
+    views: list[tuple[str, RemoteView]] = []
+    for label, host in extra_peers():
+        if skip_host and host == skip_host:
+            continue
+        views.append((label, RemoteView(host)))
+    return views
+
+
 def main(argv: list[str]) -> int:
     args = argv[1:]
     if "--help" in args or "-h" in args:
@@ -1438,19 +1691,19 @@ def main(argv: list[str]) -> int:
         view = PublicView(url)
         if once or not sys.stdout.isatty():
             return once_remote_view(view)
-        run_tui(view, url, Engine())
+        run_tui(view, url, Engine(), extra_views())
         return 0
     host = explicit or host_from_config()
     if not host:
         if not sys.stdout.isatty() or once:
             print(usage(), file=sys.stderr)
             return 2
-        run_tui(Idle(), "llmmon user@mac")
+        run_tui(Idle(), "llmmon user@mac", extras=extra_views())
         return 0
     link = f"ssh -L 11435:127.0.0.1:11434 {host}"
     if once or not sys.stdout.isatty():
         return once_remote_view(RemoteView(host))
-    run_tui(RemoteView(host), link, Engine())
+    run_tui(RemoteView(host), link, Engine(), extra_views(skip_host=host))
     return 0
 
 

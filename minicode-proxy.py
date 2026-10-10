@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import threading
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -91,7 +93,10 @@ def parse_calls(text: str) -> list[dict]:
     found = named_calls(source)
     if found:
         return found
-    return fence_calls(source)
+    found = fence_calls(source)
+    if found:
+        return found
+    return file_calls(source)
 
 
 def named_calls(source: str) -> list[dict]:
@@ -120,10 +125,22 @@ def named_calls(source: str) -> list[dict]:
 
 
 HOME = os.path.expanduser("~")
+CWD_FILE = os.path.expanduser("~/.config/minicode/cwd")
 FAKE_HOME = re.compile(
     r"(?:/Users|/home)/(?:your_username|username|your_user|user_name|<username>|<user>)(?=/|[\"'\s]|$)",
     re.IGNORECASE,
 )
+
+
+def work_dir() -> str:
+    try:
+        path = open(CWD_FILE, encoding="utf-8").read().strip()
+    except OSError:
+        path = ""
+    if path and os.path.isdir(path):
+        return path
+    desktop = os.path.join(HOME, "Desktop")
+    return desktop if os.path.isdir(desktop) else HOME
 
 
 def ground_text(value: str) -> str:
@@ -424,17 +441,38 @@ def system_prompt() -> str:
     return (
         "The shell and the files are already on the user's Mac. "
         "Do not say the command ran on another computer, and do not tell the user to copy files with scp. "
-        "When the user asks you to create a file, run a command, or open a page, call the tool and do not print a command for them to copy. "
-        "Use write, then shell. Open a page with shell command open and the url. "
+        "When the user asks you to create a file, run a command, or open a page, call the tool. "
+        "Never paste the full file in the chat. Never tell the user to save or copy the code. "
+        "Use write with path and content, then bash to run or open the file. "
+        f"New files go in the current project {work_dir()}. HTML games can also go on {desktop}. "
         "Python is already installed as python3. Never install Python. "
         f"The home directory is {HOME}. The Desktop is {desktop}. "
-        "Use these absolute paths in write and shell. Never invent your_username or /path/to."
+        "Use these absolute paths in write and bash. Never invent your_username or /path/to."
     )
 FENCE = re.compile(r"```(?:sh|bash|shell|zsh|console)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+FILE_FENCE = re.compile(
+    r"```(?P<lang>html|htm|css|js|javascript|ts|tsx|jsx|python|py|swift)\s*(?P<name>[^\n`]*)\n(?P<body>.*?)```",
+    re.DOTALL | re.IGNORECASE,
+)
+HTML_START = re.compile(r"(?i)(?:<!DOCTYPE\s+html|<html[\s>])")
 PLACEHOLDER = re.compile(r"username|macbook_ip|/path/to|/path/on|<[^>\n]+>|your_", re.IGNORECASE)
-KEEP_TOOLS = {"write", "shell", "read", "edit", "bash"}
+KEEP_TOOLS = {"write", "shell", "read", "edit", "bash", "glob", "grep"}
 MAX_HISTORY = 6
 MAX_CHARS = 1500
+_ctx = threading.local()
+LANG_EXT = {
+    "html": ".html",
+    "htm": ".html",
+    "css": ".css",
+    "js": ".js",
+    "javascript": ".js",
+    "ts": ".ts",
+    "tsx": ".tsx",
+    "jsx": ".jsx",
+    "python": ".py",
+    "py": ".py",
+    "swift": ".swift",
+}
 
 
 def fence_calls(source: str) -> list[dict]:
@@ -461,18 +499,99 @@ def fence_calls(source: str) -> list[dict]:
     return found
 
 
+def last_user() -> str:
+    return getattr(_ctx, "user", "") or ""
+
+
+def file_path(name: str, lang: str, body: str, user_text: str) -> str:
+    root = work_dir()
+    ext = LANG_EXT.get(lang.lower(), ".txt")
+    raw = (name or "").strip().strip('"').strip("'")
+    if raw.startswith("~"):
+        raw = os.path.expanduser(raw)
+    if raw and os.path.isabs(raw):
+        return raw
+    if raw and re.search(r"\.[A-Za-z0-9]{1,8}$", raw) and "/" not in raw and "\\" not in raw:
+        return os.path.join(root, raw)
+    hinted = re.search(r"((?:/Users/[^/\s]+/|~/|Desktop/)[\w./-]+\.[A-Za-z0-9]{1,8})", user_text or "")
+    if hinted:
+        return ground_text(os.path.expanduser(hinted.group(1)))
+    named = re.search(r"([\w.-]+\.(html|htm|css|js|py|swift))\b", user_text or "", re.I)
+    if named:
+        return os.path.join(root, named.group(1))
+    if re.search(r"俄罗斯方块|tetris", user_text or "", re.I) and ext == ".html":
+        return os.path.join(root, "tetris.html")
+    title = re.search(r"<title>\s*([^<]+?)\s*</title>", body or "", re.I | re.S)
+    if title and ext == ".html":
+        slug = re.sub(r"[^\w\u4e00-\u9fff]+", "-", title.group(1).strip()).strip("-")
+        if slug:
+            return os.path.join(root, slug[:40] + ".html")
+    return os.path.join(root, "index" + ext)
+
+
+def wants_run(user_text: str) -> bool:
+    return bool(re.search(r"运行|跑起来|打开|执行|open|run|launch|play", user_text or "", re.I))
+
+
+def run_calls(path: str, lang: str, user_text: str) -> list[dict]:
+    lang = (lang or "").lower()
+    quoted = shlex.quote(path)
+    if lang in ("html", "htm") or path.endswith((".html", ".htm")):
+        return [{"name": "bash", "arguments": {"command": f"open {quoted}"}}]
+    if lang in ("python", "py") or path.endswith(".py"):
+        if wants_run(user_text):
+            return [{"name": "bash", "arguments": {"command": f"python3 {quoted}"}}]
+    return []
+
+
+def file_calls(source: str) -> list[dict]:
+    user_text = last_user()
+    found = []
+    seen = set()
+    for match in FILE_FENCE.finditer(source or ""):
+        lang = (match.group("lang") or "txt").lower()
+        body = match.group("body") or ""
+        if len(body.strip()) < 30:
+            continue
+        path = file_path(match.group("name") or "", lang, body, user_text)
+        if path in seen:
+            continue
+        seen.add(path)
+        found.append({"name": "write", "arguments": {"path": path, "content": body}})
+        found.extend(run_calls(path, lang, user_text))
+    if found:
+        return found
+    text = source or ""
+    hit = HTML_START.search(text)
+    if not hit:
+        return []
+    html = text[hit.start() :]
+    end = html.lower().rfind("</html>")
+    if end >= 0:
+        html = html[: end + 7]
+    if len(html) < 80:
+        return []
+    path = file_path("", "html", html, user_text)
+    return [
+        {"name": "write", "arguments": {"path": path, "content": html}},
+        *run_calls(path, "html", user_text),
+    ]
+
+
 def classify_reply(text: str, done: bool) -> str | None:
     source = (text or "").lstrip()
     if not source:
         return "chat" if done else None
-    if source.startswith(("{", "<tool_call>", "```")):
+    if source.startswith(("{", "<tool_call>", "```", "<!DOCTYPE", "<!doctype", "<html", "<HTML")):
+        return "tool"
+    if HTML_START.match(source):
         return "tool"
     if NAMED_CALL.match(source):
         return "tool"
     if len(source) >= 8 and not any(mark in source[:8] for mark in "{<`"):
         return "chat"
     if done or len(source) >= 64:
-        return "tool" if (NAMED_CALL.search(source) or '"arguments"' in source) else "chat"
+        return "tool" if (NAMED_CALL.search(source) or '"arguments"' in source or HTML_START.search(source)) else "chat"
     return None
 
 
@@ -555,6 +674,12 @@ def prepare(body: bytes) -> bytes:
         limit = 8000 if index == last and message.get("role") == "user" else MAX_CHARS
         trimmed.append(trim_message(message, limit))
     incoming["messages"] = [{"role": "system", "content": system_prompt()}, *trimmed]
+    user_text = ""
+    for message in reversed(trimmed):
+        if message.get("role") == "user":
+            user_text = message.get("content") or ""
+            break
+    _ctx.user = user_text
     tools = incoming.get("tools")
     if isinstance(tools, list):
         compact = [tool for item in tools if (tool := compact_tool(item))]
