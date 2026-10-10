@@ -241,7 +241,7 @@ install_tunnel() {
   bootstrap_agent com.llmmon.minicode.tunnel "$plist"
 }
 
-INSTRUCTION='When the user asks you to create a folder, call bash: mkdir -p and the absolute path. Never use write for a folder; write creates a file. When the user asks you to create, change, or run a file, call write and then bash. Do not paste the file in chat. Do not tell the user to save or copy the code. Open an HTML page with bash: open and the absolute path. Run a Python file with python3 and the absolute path. Python is already installed as python3. Never install Python.'
+INSTRUCTION='Do only what the user asked. A folder request is only mkdir. Do not write Hello World or open a browser unless they asked for a page. When they ask for a file, call write and then bash. Python is already installed as python3. Never install Python.'
 
 install_opencode() {
   if ! command -v opencode >/dev/null 2>&1; then

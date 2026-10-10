@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Local coding shim in front of the small model.
 
-The 7B model is not trusted to pick tools. This process reads the user turn,
-does obvious filesystem work itself, and only then forwards harder writing
-to the model. Dumped files still become write plus bash.
+The small model is only asked to write code. This process decides tools the
+way a precise agent does: a folder request only makes that folder, a file
+request may write, and everything else is chat with no side effects.
 """
 
 from __future__ import annotations
@@ -52,8 +52,10 @@ def as_call(obj) -> dict | None:
 
 
 def parse_calls(text: str) -> list[dict]:
-    if is_folder_request(last_user()):
-        return correct_calls([])
+    if current_intent() != "write":
+        if current_intent() == "folder":
+            return correct_calls([])
+        return []
     found = []
     for raw in TOOL_BLOCK.findall(text or ""):
         try:
@@ -217,6 +219,13 @@ def rewrite_openai(payload: dict) -> dict:
     if not choices:
         return payload
     message = choices[0].get("message") or {}
+    intent = current_intent()
+    if intent == "chat":
+        if message.get("tool_calls"):
+            message = dict(message)
+            message.pop("tool_calls", None)
+            choices[0]["message"] = message
+        return payload
     if message.get("tool_calls"):
         ground_tool_calls(message["tool_calls"])
         calls = correct_calls(calls_from_openai(message["tool_calls"]))
@@ -225,6 +234,8 @@ def rewrite_openai(payload: dict) -> dict:
             message["content"] = ""
             choices[0]["message"] = message
             choices[0]["finish_reason"] = "tool_calls"
+        return payload
+    if intent != "write":
         return payload
     calls = correct_calls(parse_calls(message.get("content") or ""))
     if not calls:
@@ -238,6 +249,13 @@ def rewrite_openai(payload: dict) -> dict:
 
 def rewrite_ollama(payload: dict) -> dict:
     message = payload.get("message") or {}
+    intent = current_intent()
+    if intent == "chat":
+        if message.get("tool_calls"):
+            message = dict(message)
+            message.pop("tool_calls", None)
+            payload["message"] = message
+        return payload
     if message.get("tool_calls"):
         ground_tool_calls(message["tool_calls"])
         calls = correct_calls(calls_from_ollama(message["tool_calls"]))
@@ -245,6 +263,8 @@ def rewrite_ollama(payload: dict) -> dict:
             message["tool_calls"] = ollama_tool_calls(calls)
             message["content"] = ""
             payload["message"] = message
+        return payload
+    if intent != "write":
         return payload
     calls = correct_calls(parse_calls(message.get("content") or ""))
     if not calls:
@@ -455,6 +475,9 @@ class Handler(BaseHTTPRequestHandler):
                     native = True
                 if text:
                     parts.append(text)
+            if current_intent() == "chat":
+                self._send(200, "text/event-stream", ground_bytes(bytes(held)))
+                return
             if native:
                 calls = correct_calls(native_calls_from_sse(bytes(held)))
                 if calls:
@@ -462,7 +485,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._send(200, "text/event-stream", ground_bytes(bytes(held)))
                 return
-            calls = correct_calls(parse_calls("".join(parts)))
+            calls = correct_calls(parse_calls("".join(parts))) if current_intent() == "write" else []
             if calls:
                 self._send(200, "text/event-stream", tool_stream(model, calls))
                 return
@@ -483,11 +506,11 @@ def system_prompt() -> str:
     return (
         "The shell and the files are already on the user's Mac. "
         "Do not say the command ran on another computer, and do not tell the user to copy files with scp. "
-        "You only write and edit files. Folders are created for you. "
-        "When the user asks you to create a file, run a command, or open a page, call the tool. "
-        "Never use write to make a folder. write always creates a file and needs a suffix like .html or .py. "
-        "Never paste the full file in the chat. Never tell the user to save or copy the code. "
-        "Use write with path and content, then bash to run or open the file. "
+        "Do only what the user asked. If they asked for a folder, do not write a file and do not open a browser. "
+        "If they did not ask for HTML or Hello World, do not create it. "
+        "When they ask you to create a file, call write with path and content. "
+        "Never use write to make a folder. write always needs a suffix like .html or .py. "
+        "Never paste the full file in the chat. "
         f"New files go in the current project {work_dir()}. HTML games can also go on {desktop}. "
         "Python is already installed as python3. Never install Python. "
         f"The home directory is {HOME}. The Desktop is {desktop}. "
@@ -559,6 +582,21 @@ def user_text_of(content) -> str:
 
 def last_user() -> str:
     return user_text_of(getattr(_ctx, "user", "") or "")
+
+
+def classify_intent(text: str = "") -> str:
+    text = user_text_of(text or last_user())
+    if is_folder_only(text):
+        return "folder"
+    if FILE_ASK.search(text) or re.search(r"(?:写一?个|生成|创建|新建).{0,16}(?:文件|页面|脚本)", text):
+        return "write"
+    if re.search(r"运行|跑起来|执行|浏览器|打开.*(?:html|页面|文件)|python3", text):
+        return "run"
+    return "chat"
+
+
+def current_intent() -> str:
+    return getattr(_ctx, "intent", "") or classify_intent(last_user())
 
 
 FOLDER_ASK = re.compile(
@@ -863,7 +901,7 @@ def run_calls(path: str, lang: str, user_text: str) -> list[dict]:
 
 def file_calls(source: str) -> list[dict]:
     user_text = last_user()
-    if is_folder_only(user_text) or not wants_page(user_text):
+    if current_intent() != "write":
         return []
     found = []
     seen = set()
@@ -999,10 +1037,13 @@ def prepare(body: bytes) -> bytes:
             user_text = user_text_of(message.get("content"))
             break
     _ctx.user = user_text
+    _ctx.intent = classify_intent(user_text)
     tools = incoming.get("tools")
-    if isinstance(tools, list):
+    if _ctx.intent == "chat":
+        incoming.pop("tools", None)
+    elif isinstance(tools, list):
         compact = [tool for item in tools if (tool := compact_tool(item))]
-        if is_folder_only(user_text):
+        if _ctx.intent == "folder":
             compact = [tool for tool in compact if (tool.get("function") or {}).get("name") in {"bash", "shell"}]
         if compact:
             incoming["tools"] = compact
