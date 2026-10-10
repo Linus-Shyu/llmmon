@@ -404,9 +404,18 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             incoming = {}
         if self.command == "POST" and path.startswith(("/v1/chat/completions", "/api/chat")):
+            model = incoming.get("model") or "coder"
+            said = short_circuit_text()
+            if said:
+                if incoming.get("stream") and path.startswith("/v1/chat/completions"):
+                    self._send(200, "text/event-stream", text_stream(model, said))
+                elif path.startswith("/v1/chat/completions"):
+                    self._send(200, "application/json", text_json(model, said))
+                else:
+                    self._send(200, "application/json", ollama_text_json(said))
+                return
             forced = short_circuit_calls()
             if forced:
-                model = incoming.get("model") or "coder"
                 if incoming.get("stream") and path.startswith("/v1/chat/completions"):
                     self._send(200, "text/event-stream", tool_stream(model, forced))
                 elif path.startswith("/v1/chat/completions"):
@@ -599,7 +608,10 @@ def wants_install(text: str) -> bool:
 
 def classify_intent(text: str = "") -> str:
     text = user_text_of(text or last_user())
-    if is_folder_only(text):
+    if PWD_ASK.search(text):
+        return "pwd"
+    moving = bool(cd_target(text))
+    if is_folder_only(text) and not moving:
         return "folder"
     writing = bool(
         re.search(r"(?:写一?个|生成|创建|新建).{0,24}(?:文件|页面|脚本|代码|\.py|\.html|\.js)", text)
@@ -612,6 +624,8 @@ def classify_intent(text: str = "") -> str:
         return "write"
     if wants_install(text):
         return "install"
+    if moving:
+        return "cd"
     if re.search(r"运行|跑起来|执行|浏览器|打开.*(?:html|页面|文件)|python3", text):
         return "run"
     return "chat"
@@ -709,6 +723,61 @@ def folder_path(user_text: str) -> str:
 
 def mkdir_call(path: str) -> dict:
     return {"name": "bash", "arguments": {"command": f"mkdir -p {shlex.quote(path)}"}}
+
+
+RECENT_FILE = os.path.expanduser("~/.config/minicode/recent")
+CD_ASK = re.compile(r"切换|切到|换到|进入|转到|(?:工作|项目)目录|^\s*cd\s", re.I)
+PWD_ASK = re.compile(r"(?:工作|项目|当前)目录.{0,6}(?:在哪|是什么|是哪|多少)|^\s*pwd\s*$", re.I)
+PATH_TOKEN = re.compile(r"(?<![\w/])((?:~|/)[^\s，。,;；\"'`]*|Desktop/[^\s，。,;；\"'`]+)")
+CD_NAME = re.compile(
+    r"(?:到|进入|设为|设成|改成|改为|换成|cd)\s*(?:桌面(?:上)?的?)?\s*"
+    r"([A-Za-z0-9_.\-\u4e00-\u9fff]+?)\s*(?:这个)?(?:工作|项目)?(?:目录|文件夹|folder)?"
+    r"(?=$|[\s，。,;；]|然后|并且|再)",
+    re.I,
+)
+
+
+def set_work_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+    os.makedirs(os.path.dirname(CWD_FILE), exist_ok=True)
+    with open(CWD_FILE, "w", encoding="utf-8") as handle:
+        handle.write(path + "\n")
+    try:
+        recent = [line.strip() for line in open(RECENT_FILE, encoding="utf-8") if line.strip()]
+    except OSError:
+        recent = []
+    recent = [path] + [item for item in recent if item != path]
+    with open(RECENT_FILE, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(recent[:10]) + "\n")
+
+
+def cd_target(text: str) -> str:
+    text = user_text_of(text)
+    if not CD_ASK.search(text):
+        return ""
+    found = PATH_TOKEN.search(text)
+    if found:
+        raw = found.group(1)
+        if raw.startswith("Desktop/"):
+            raw = os.path.join(HOME, raw)
+        return os.path.normpath(os.path.expanduser(raw))
+    found = CD_NAME.search(text)
+    if not found:
+        return ""
+    name = found.group(1)
+    desktop = os.path.join(HOME, "Desktop")
+    if name in {"桌面", "Desktop", "desktop"}:
+        return desktop
+    if name.lower() in FOLDER_SKIP or len(name) > 40:
+        return ""
+    if re.search(r"桌面|Desktop", text, re.I):
+        return os.path.join(desktop, name)
+    if os.path.basename(work_dir()) == name:
+        return work_dir()
+    for root in (work_dir(), desktop, HOME):
+        if os.path.isdir(os.path.join(root, name)):
+            return os.path.join(root, name)
+    return os.path.join(work_dir(), name)
 
 
 STDLIB = {
@@ -873,8 +942,37 @@ def install_calls(extra: list[str] | None = None, root: str = "") -> list[dict]:
     return [bash_call(command)]
 
 
+def done_text() -> str:
+    intent = current_intent()
+    output = getattr(_ctx, "tool_output", "") or ""
+    if intent == "cd":
+        return f"工作目录已换到 {work_dir()}。之后写文件、跑命令、装依赖都在这里。"
+    if intent == "folder":
+        return f"文件夹已建好：{folder_path(last_user())}"
+    if intent == "install":
+        lines = [line for line in output.splitlines() if line.strip()]
+        tail = "\n".join(lines[-12:])
+        if re.search(r"Traceback|error:|ERROR|CalledProcessError|command not found", output):
+            return "安装没有成功，最后几行：\n" + tail
+        return "依赖装好了，在 " + work_dir() + "。\n" + tail
+    return ""
+
+
+def short_circuit_text() -> str:
+    intent = current_intent()
+    if intent == "pwd":
+        return f"现在的工作目录是 {work_dir()}。说“切换到 路径”可以换。"
+    if getattr(_ctx, "after_tool", False) and intent in {"cd", "folder", "install"}:
+        return done_text()
+    return ""
+
+
 def short_circuit_calls() -> list[dict]:
     user = last_user()
+    if getattr(_ctx, "after_tool", False):
+        return []
+    if current_intent() == "cd":
+        return [bash_call(f"cd {shlex.quote(work_dir())} && pwd && ls")]
     if current_intent() == "install" or (wants_install(user) and not FILE_ASK.search(user)):
         calls = install_calls()
         if calls:
@@ -909,6 +1007,50 @@ def tool_json(model: str, calls: list[dict]) -> bytes:
                 }
             ],
         },
+        ensure_ascii=False,
+    ).encode()
+
+
+def text_json(model: str, text: str) -> bytes:
+    return json.dumps(
+        {
+            "id": "chatcmpl-minicode",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        ensure_ascii=False,
+    ).encode()
+
+
+def text_stream(model: str, text: str) -> bytes:
+    chunks = [
+        {"role": "assistant", "content": text},
+        {},
+    ]
+    lines = []
+    for index, delta in enumerate(chunks):
+        event = {
+            "id": "chatcmpl-minicode",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": "stop" if index else None}],
+        }
+        lines.append(("data: " + json.dumps(event, ensure_ascii=False)).encode() + b"\n\n")
+    lines.append(b"data: [DONE]\n\n")
+    return b"".join(lines)
+
+
+def ollama_text_json(text: str) -> bytes:
+    return json.dumps(
+        {"model": "coder", "done": True, "message": {"role": "assistant", "content": text}},
         ensure_ascii=False,
     ).encode()
 
@@ -998,10 +1140,21 @@ def correct_calls(calls: list[dict]) -> list[dict]:
     user = last_user()
     folder = is_folder_request(user)
     out: list[dict] = []
+    root = work_dir()
     for call in calls or []:
         name = str(call.get("name") or "").lower()
         args = decode_args(call.get("arguments"))
         path = str(args.get("path") or args.get("filePath") or "")
+        if path and not os.path.isabs(os.path.expanduser(path)):
+            path = os.path.join(root, path)
+            for key in ("path", "filePath"):
+                if key in args:
+                    args[key] = path
+            call = {"name": call.get("name"), "arguments": args}
+        command = args.get("command")
+        if name in {"bash", "shell"} and isinstance(command, str) and command.strip() and not command.lstrip().startswith("cd "):
+            args["command"] = f"cd {shlex.quote(root)} && {command}"
+            call = {"name": call.get("name"), "arguments": args}
         content = args.get("content") if args.get("content") is not None else args.get("contents")
         content_s = content if isinstance(content, str) else ""
         if folder and name == "write":
@@ -1236,6 +1389,15 @@ def prepare(body: bytes) -> bytes:
             user_text = user_text_of(message.get("content"))
             break
     _ctx.user = user_text
+    last = kept[-1] if kept else {}
+    _ctx.after_tool = last.get("role") == "tool"
+    _ctx.tool_output = user_text_of(last.get("content")) if _ctx.after_tool else ""
+    target = cd_target(user_text)
+    if target and target != work_dir():
+        try:
+            set_work_dir(target)
+        except OSError:
+            pass
     _ctx.intent = classify_intent(user_text)
     tools = incoming.get("tools")
     if _ctx.intent == "chat":

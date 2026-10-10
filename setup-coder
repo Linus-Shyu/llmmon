@@ -275,6 +275,7 @@ perm.update(
         "websearch": "deny",
         "subagent": "deny",
         "question": "deny",
+        "external_directory": "allow",
     }
 )
 data["permission"] = perm

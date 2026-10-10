@@ -66,7 +66,91 @@ start_agent() {
 }
 
 mkdir -p "$HOME/.config/minicode"
+recent_file="$HOME/.config/minicode/recent"
+
+pick=""
+case "${1:-}" in
+  --dir|-C)
+    pick=${2:-}
+    if [ $# -ge 2 ]; then shift 2; else shift; fi
+    [ -n "$pick" ] && mkdir -p "$pick"
+    ;;
+  --pick)
+    pick=ASK
+    shift
+    ;;
+  *)
+    if [ -n "${1:-}" ] && [ -d "$1" ]; then
+      pick=$1
+      shift
+    fi
+    ;;
+esac
+if [ -z "$pick" ] && { [ "$(pwd)" = "$HOME" ] || [ "$(pwd)" = / ]; } && [ -t 0 ]; then
+  pick=ASK
+fi
+if [ "$pick" = ASK ]; then
+  pick=$(python3 - "$recent_file" "$(pwd)" << 'PY'
+import os, sys
+recent_file, here = sys.argv[1], sys.argv[2]
+home = os.path.expanduser("~")
+desktop = os.path.join(home, "Desktop")
+seen, items = set(), []
+
+def add(path):
+    path = os.path.normpath(path)
+    if path in seen or not os.path.isdir(path):
+        return
+    seen.add(path)
+    items.append(path)
+
+try:
+    for line in open(recent_file, encoding="utf-8"):
+        add(line.strip())
+except OSError:
+    pass
+add(here)
+try:
+    for name in sorted(os.listdir(desktop)):
+        if not name.startswith("."):
+            add(os.path.join(desktop, name))
+except OSError:
+    pass
+add(desktop)
+items = items[:15]
+tty = open("/dev/tty", "r+")
+tty.write("选一个工作目录（回车用第 1 个，也可以直接输入路径，新路径会自动建好）：\n")
+for index, path in enumerate(items, 1):
+    tty.write(f"  {index:>2}  {path.replace(home, '~', 1)}\n")
+tty.write("> ")
+tty.flush()
+answer = tty.readline().strip()
+if not answer:
+    choice = items[0] if items else here
+elif answer.isdigit() and 1 <= int(answer) <= len(items):
+    choice = items[int(answer) - 1]
+else:
+    choice = os.path.abspath(os.path.expanduser(answer))
+    os.makedirs(choice, exist_ok=True)
+print(choice)
+PY
+)
+fi
+if [ -n "$pick" ]; then
+  cd "$pick"
+fi
 printf '%s\n' "$(pwd)" > "$HOME/.config/minicode/cwd"
+python3 - "$recent_file" "$(pwd)" << 'PY'
+import sys
+recent_file, here = sys.argv[1], sys.argv[2]
+try:
+    recent = [line.strip() for line in open(recent_file, encoding="utf-8") if line.strip()]
+except OSError:
+    recent = []
+recent = [here] + [item for item in recent if item != here]
+open(recent_file, "w", encoding="utf-8").write("\n".join(recent[:10]) + "\n")
+PY
+echo "工作目录: $(pwd)"
 if [ -x "$HOME/.config/minicode/setup-coder" ]; then
   sh "$HOME/.config/minicode/setup-coder" --apply >/dev/null 2>&1 || true
 fi

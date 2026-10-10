@@ -53,6 +53,16 @@ minicode    # 在当前目录里让模型改文件、跑命令
 
 `minicode` 是终端里的会话，不是从访达打开的应用。它调用本机的 OpenCode，模型地址走本机 `127.0.0.1:11436` 的代理。让它写文件或打开页面时，它会自己落盘并运行，不要只把代码贴在对话里。每次启动会把当前目录、OpenCode 权限和代理更新到这一版。改文件或跑命令之前会问你。用 `Ctrl+C` 离开。系统自带的「终端」画这个界面会崩溃（CoreText 字体回退里的 `EXC_ARM_PAC_FAIL`）。装了 Warp 时，`minicode` 会改到 Warp 里打开。否则用 iTerm 或 Warp。
 
+工作目录由你选：
+
+```bash
+minicode ~/Desktop/game     # 在这个目录里开
+minicode --dir ~/code/new   # 目录不存在就建好再开
+minicode --pick             # 从最近用过的目录和桌面上的文件夹里选
+```
+
+在家目录里直接敲 `minicode` 也会弹出这个列表。会话里说「切换到桌面的 test 目录」或「把工作目录设为 ~/code/app」就换过去，之后写文件、跑命令、装依赖都在那里。问「现在工作目录在哪」会直接回答。最近用过的目录记在 `~/.config/minicode/recent`。
+
 已经装过的机器用 `./install.sh --client` 对齐这一版。本机和另一台写代码的 Mac 都要跑一次，旧的 `execute: deny` 会被拿掉。
 
 ![minicode](docs/minicode.png)
