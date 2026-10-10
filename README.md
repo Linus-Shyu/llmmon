@@ -100,6 +100,8 @@ OpenCode 本体不改。安装的是 Homebrew 里的 `anomalyco/tap/opencode-v2`
 
 看画面的那台 Mac 优先读 `~/.config/llmmon/url` 和 `~/.config/llmmon/token`，用 HTTPS 拉 `/snapshot`。没有这个地址时，才用 `~/.config/llmmon/host` 里的 `user@host` 走 SSH。环境变量 `LLMMON_URL`、`LLMMON_TOKEN`、`LLMMON_HOST` 可以盖过文件。再加一台机器写在 `~/.config/llmmon/peers`，每行 `标签 user@host`，画面底部会多一条状态带。
 
+`qwen2.5-coder:7b` 常把工具调用当文字吐出来，所以代理替它决定工具。换成会自己调工具的模型（例如 `qwen3.5:9b`）时，建一个空文件 `~/.config/minicode/native`：代理每一轮都把工具交给模型，关掉思考，保留更长的对话。
+
 模型地址写在 `~/.config/minicode/upstream`。代理先读这个文件，文件没有时才用启动项里的 `MINICODE_UPSTREAM`。
 
 Ollama 留在 `127.0.0.1:11434`，不要直接开到局域网。另一台电脑通过隧道访问。

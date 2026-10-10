@@ -27,6 +27,16 @@ def current_upstream() -> str:
     except OSError:
         chosen = ""
     return (chosen or UPSTREAM).rstrip("/")
+
+
+NATIVE_FILE = os.path.expanduser("~/.config/minicode/native")
+
+
+def native() -> bool:
+    """The model calls tools well on its own, so keep them in every turn."""
+    return os.environ.get("MINICODE_NATIVE") == "1" or os.path.exists(NATIVE_FILE)
+
+
 _listen = os.environ.get("MINICODE_LISTEN", "127.0.0.1:11436")
 _host, _port = _listen.rsplit(":", 1)
 LISTEN = (_host, int(_port))
@@ -220,7 +230,7 @@ def rewrite_openai(payload: dict) -> dict:
         return payload
     message = choices[0].get("message") or {}
     intent = current_intent()
-    if intent == "chat":
+    if intent == "chat" and not native():
         if message.get("tool_calls"):
             message = dict(message)
             message.pop("tool_calls", None)
@@ -250,7 +260,7 @@ def rewrite_openai(payload: dict) -> dict:
 def rewrite_ollama(payload: dict) -> dict:
     message = payload.get("message") or {}
     intent = current_intent()
-    if intent == "chat":
+    if intent == "chat" and not native():
         if message.get("tool_calls"):
             message = dict(message)
             message.pop("tool_calls", None)
@@ -397,7 +407,7 @@ class Handler(BaseHTTPRequestHandler):
     def _forward(self, body: bytes) -> None:
         path = self.path
         if self.command == "POST" and (path.startswith("/v1/chat/completions") or path.startswith("/api/chat")):
-            body = prepare(body)
+            body = prepare(body, path)
         incoming = {}
         try:
             incoming = json.loads(body.decode() or "{}") if body else {}
@@ -1360,7 +1370,7 @@ def trim_message(message: dict, limit: int) -> dict:
     return message
 
 
-def prepare(body: bytes) -> bytes:
+def prepare(body: bytes, path: str = "") -> bytes:
     if not body:
         return body
     try:
@@ -1370,18 +1380,28 @@ def prepare(body: bytes) -> bytes:
     messages = incoming.get("messages")
     if not isinstance(messages, list):
         return body
+    agent = native()
+    history = 16 if agent else MAX_HISTORY
+    chars = 4000 if agent else MAX_CHARS
     kept = []
     for message in messages:
         if not isinstance(message, dict) or message.get("role") in ("system", "developer"):
             continue
         kept.append(message)
-    if len(kept) > MAX_HISTORY:
-        kept = kept[-MAX_HISTORY:]
+    if len(kept) > history:
+        kept = kept[-history:]
+    while kept and kept[0].get("role") == "tool":
+        kept.pop(0)
     trimmed = []
     last = len(kept) - 1
     for index, message in enumerate(kept):
-        limit = 8000 if index == last and message.get("role") == "user" else MAX_CHARS
+        limit = 8000 if index == last and message.get("role") == "user" else chars
         trimmed.append(trim_message(message, limit))
+    if agent:
+        if path.startswith("/v1/"):
+            incoming["reasoning_effort"] = "none"
+        else:
+            incoming["think"] = False
     incoming["messages"] = [{"role": "system", "content": system_prompt()}, *trimmed]
     user_text = ""
     for message in reversed(trimmed):
@@ -1400,11 +1420,11 @@ def prepare(body: bytes) -> bytes:
             pass
     _ctx.intent = classify_intent(user_text)
     tools = incoming.get("tools")
-    if _ctx.intent == "chat":
+    if _ctx.intent == "chat" and not agent:
         incoming.pop("tools", None)
     elif isinstance(tools, list):
         compact = [tool for item in tools if (tool := compact_tool(item))]
-        if _ctx.intent in {"folder", "install", "run"}:
+        if _ctx.intent in {"folder", "install", "run"} and not agent:
             compact = [tool for tool in compact if (tool.get("function") or {}).get("name") in {"bash", "shell"}]
         if compact:
             incoming["tools"] = compact
