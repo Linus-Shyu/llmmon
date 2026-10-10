@@ -84,7 +84,7 @@ OpenCode 本体不改。安装的是 Homebrew 里的 `anomalyco/tap/opencode-v2`
 | `install.sh` | 一行安装的入口。`--server` 装模型那台，`--url` 装看画面那台，`--client` 把本机工具更新到这一版 |
 | `setup-coder` | 按内存装 `coder`，并接上 OpenCode。`--apply` 只更新本机工具 |
 | `minicode` | 启动 OpenCode，模型走本机代理。每次启动会同步配置 |
-| `minicode-proxy.py` | 写代码的闸门。建文件夹这类事它自己 `mkdir`，不经过模型。模型吐出的代码会转成 `write` / `bash`。听 `127.0.0.1:11436` |
+| `minicode-proxy.py` | 写代码的闸门。建文件夹它自己 `mkdir`。安装环境它看 `requirements.txt`、`package.json` 和 import，再 `venv`/`pip`/`npm`。没让写文件就不会写。听 `127.0.0.1:11436` |
 | `tunnel.sh` | 在跑模型的 Mac 上用 cloudflared 往外开隧道 |
 | `serve.sh` | 防止睡眠，Ollama 空了就重新载入 `coder`，然后调用 `tunnel.sh` |
 

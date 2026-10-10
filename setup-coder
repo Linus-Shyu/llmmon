@@ -241,7 +241,7 @@ install_tunnel() {
   bootstrap_agent com.llmmon.minicode.tunnel "$plist"
 }
 
-INSTRUCTION='Do only what the user asked. A folder request is only mkdir. Do not write Hello World or open a browser unless they asked for a page. When they ask for a file, call write and then bash. Python is already installed as python3. Never install Python.'
+INSTRUCTION='Do only what the user asked. A folder request is only mkdir. Install libraries from the project: Python uses .venv and pip, Node uses npm. Do not write Hello World or open a browser unless they asked for a page. When they ask for a file, call write and then bash. Python is already installed as python3. Never install Python unless they asked for a Python toolchain.'
 
 install_opencode() {
   if ! command -v opencode >/dev/null 2>&1; then
@@ -310,8 +310,10 @@ PY
 stash_client_files() {
   mkdir -p "$HOME/.config/minicode" "$HOME/bin"
   for name in setup-coder minicode minicode-proxy.py llmmon; do
-    if [ -f "$ROOT/$name" ]; then
-      cp "$ROOT/$name" "$HOME/.config/minicode/$name"
+    src="$ROOT/$name"
+    dest="$HOME/.config/minicode/$name"
+    if [ -f "$src" ] && [ ! "$src" -ef "$dest" ]; then
+      cp "$src" "$dest"
     fi
   done
 }

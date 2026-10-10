@@ -508,6 +508,7 @@ def system_prompt() -> str:
         "Do not say the command ran on another computer, and do not tell the user to copy files with scp. "
         "Do only what the user asked. If they asked for a folder, do not write a file and do not open a browser. "
         "If they did not ask for HTML or Hello World, do not create it. "
+        "When they ask to install libraries or a dev environment, the proxy already emits bash that reads the project and installs into .venv or with npm. Do not invent packages. "
         "When they ask you to create a file, call write with path and content. "
         "Never use write to make a folder. write always needs a suffix like .html or .py. "
         "Never paste the full file in the chat. "
@@ -584,12 +585,33 @@ def last_user() -> str:
     return user_text_of(getattr(_ctx, "user", "") or "")
 
 
+INSTALL_ASK = re.compile(
+    r"(?:安装|装)\s*(?:一下)?(?:所需|需要|项目|代码)?(?:的)?(?:库|依赖|开发环境|环境|packages?|deps)|"
+    r"装库|开发环境|根据代码安装|pip install|npm i(?:nstall)?|requirements|venv|virtualenv|"
+    r"install\s+(?:deps|dependencies|packages|requirements)",
+    re.I,
+)
+
+
+def wants_install(text: str) -> bool:
+    return bool(INSTALL_ASK.search(user_text_of(text)))
+
+
 def classify_intent(text: str = "") -> str:
     text = user_text_of(text or last_user())
     if is_folder_only(text):
         return "folder"
-    if FILE_ASK.search(text) or re.search(r"(?:写一?个|生成|创建|新建).{0,16}(?:文件|页面|脚本)", text):
+    writing = bool(
+        re.search(r"(?:写一?个|生成|创建|新建).{0,24}(?:文件|页面|脚本|代码|\.py|\.html|\.js)", text)
+        or re.search(r"tetris|俄罗斯方块|(?<!根据)代码|(?<!根据)脚本", text)
+        or (FILE_ASK.search(text) and re.search(r"写|生成|页面|游戏|\.html|\.py|\.js", text))
+    )
+    if wants_install(text) and not writing:
+        return "install"
+    if writing:
         return "write"
+    if wants_install(text):
+        return "install"
     if re.search(r"运行|跑起来|执行|浏览器|打开.*(?:html|页面|文件)|python3", text):
         return "run"
     return "chat"
@@ -689,8 +711,174 @@ def mkdir_call(path: str) -> dict:
     return {"name": "bash", "arguments": {"command": f"mkdir -p {shlex.quote(path)}"}}
 
 
+STDLIB = {
+    "abc", "argparse", "ast", "asyncio", "base64", "collections", "concurrent", "contextlib",
+    "copy", "csv", "ctypes", "dataclasses", "datetime", "decimal", "enum", "functools",
+    "glob", "hashlib", "hmac", "html", "http", "importlib", "inspect", "io", "itertools",
+    "json", "logging", "math", "multiprocessing", "os", "pathlib", "pickle", "platform",
+    "pprint", "queue", "random", "re", "secrets", "shlex", "shutil", "signal", "socket",
+    "sqlite3", "ssl", "stat", "string", "struct", "subprocess", "sys", "tempfile",
+    "textwrap", "threading", "time", "tkinter", "tomllib", "traceback", "turtle", "types",
+    "typing", "unittest", "urllib", "uuid", "venv", "warnings", "weakref", "webbrowser",
+    "xml", "zipfile", "zoneinfo",
+}
+PIP_NAME = {
+    "cv2": "opencv-python",
+    "PIL": "Pillow",
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+    "bs4": "beautifulsoup4",
+    "yaml": "PyYAML",
+    "dotenv": "python-dotenv",
+    "dateutil": "python-dateutil",
+    "lxml": "lxml",
+    "requests": "requests",
+    "flask": "flask",
+    "fastapi": "fastapi",
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "httpx": "httpx",
+    "toml": "toml",
+}
+IMPORT_LINE = re.compile(r"^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
+SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".tox", "dist", "build"}
+
+
+def python_imports(source: str, skip: set[str] | None = None) -> list[str]:
+    found = []
+    ignore = STDLIB | (skip or set())
+    for match in IMPORT_LINE.finditer(source or ""):
+        top = match.group(1)
+        if top in ignore or top.startswith("_"):
+            continue
+        pkg = PIP_NAME.get(top, top)
+        if pkg and pkg not in found:
+            found.append(pkg)
+    return found
+
+
+def named_packages(user_text: str) -> list[str]:
+    found = []
+    for match in re.finditer(
+        r"(?:pip3? install|npm i(?:nstall)?|--save|安装)\s+([A-Za-z0-9_.\-@/ ]+)",
+        user_text or "",
+        re.I,
+    ):
+        for part in match.group(1).split():
+            if part.lower() in {"和", "以及", "依赖", "库", "环境", "-r", "-g", "python", "python3", "node"}:
+                continue
+            if re.fullmatch(r"[@A-Za-z0-9_.\-/]+", part) and part not in found:
+                found.append(part)
+    return found
+
+
+def bash_call(command: str) -> dict:
+    return {"name": "bash", "arguments": {"command": command}}
+
+
+def wants_toolchain(user_text: str) -> bool:
+    return bool(re.search(r"开发环境|toolchain|nodejs|\bnpm\b|brew install", user_text or "", re.I))
+
+
+INSTALL_PY = r"""
+import json, os, re, subprocess, sys
+STDLIB = set(%s)
+PIP_NAME = %s
+SKIP = set(%s)
+IMPORT = re.compile(r"^\s*(?:import|from)\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
+root = os.path.abspath(sys.argv[1])
+extra = json.loads(sys.argv[2]) if len(sys.argv) > 2 else []
+tools = sys.argv[3] == "1" if len(sys.argv) > 3 else False
+os.chdir(root)
+
+def run(cmd):
+    print("+", " ".join(cmd), flush=True)
+    subprocess.check_call(cmd)
+
+files = []
+for dirpath, dirnames, names in os.walk(root):
+    rel = os.path.relpath(dirpath, root)
+    depth = 0 if rel == "." else rel.count(os.sep) + 1
+    dirnames[:] = [d for d in dirnames if d not in SKIP and not d.startswith(".")]
+    if depth > 2:
+        dirnames.clear()
+        continue
+    for name in names:
+        files.append(os.path.join(dirpath, name))
+py = [p for p in files if p.endswith(".py")]
+local = {os.path.splitext(os.path.basename(p))[0] for p in py}
+pkgs = []
+for item in extra:
+    if item and item not in pkgs:
+        pkgs.append(item)
+for path in py:
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        continue
+    for match in IMPORT.finditer(text):
+        top = match.group(1)
+        if top in STDLIB or top in local or top.startswith("_"):
+            continue
+        pkg = PIP_NAME.get(top, top)
+        if pkg and pkg not in pkgs:
+            pkgs.append(pkg)
+has_pkg = os.path.isfile("package.json")
+has_req = os.path.isfile("requirements.txt")
+has_proj = os.path.isfile("pyproject.toml")
+has_go = os.path.isfile("go.mod")
+has_cargo = os.path.isfile("Cargo.toml")
+if tools and has_pkg:
+    run(["/bin/sh", "-c", "command -v npm >/dev/null || brew install node"])
+if tools and (py or has_req or has_proj or pkgs):
+    run(["/bin/sh", "-c", "command -v python3 >/dev/null || brew install python"])
+if has_pkg:
+    cmd = ["npm", "install"]
+    if extra and not (py or has_req or has_proj):
+        cmd.extend(extra)
+    run(cmd)
+if py or has_req or has_proj or pkgs:
+    run([sys.executable, "-m", "venv", ".venv"])
+    pip = os.path.join(root, ".venv", "bin", "pip")
+    run([pip, "install", "-U", "pip"])
+    if has_req:
+        run([pip, "install", "-r", "requirements.txt"])
+    elif has_proj:
+        run([pip, "install", "-e", root])
+    if pkgs:
+        run([pip, "install", *pkgs])
+if has_go:
+    run(["go", "mod", "download"])
+if has_cargo:
+    run(["cargo", "fetch"])
+if not (has_pkg or py or has_req or has_proj or has_go or has_cargo or pkgs):
+    print("no project files to install from", flush=True)
+""" % (repr(STDLIB), repr(PIP_NAME), repr(SKIP_DIRS))
+
+
+def install_calls(extra: list[str] | None = None, root: str = "") -> list[dict]:
+    root = root or work_dir()
+    user = last_user()
+    pkgs = named_packages(user)
+    if extra:
+        for pkg in extra:
+            if pkg not in pkgs:
+                pkgs.append(pkg)
+    command = "python3 - {root} {pkgs} {tools} <<'PY'\n{script}\nPY".format(
+        root=shlex.quote(root),
+        pkgs=shlex.quote(json.dumps(pkgs, ensure_ascii=False)),
+        tools="1" if wants_toolchain(user) else "0",
+        script=INSTALL_PY.strip(),
+    )
+    return [bash_call(command)]
+
+
 def short_circuit_calls() -> list[dict]:
     user = last_user()
+    if current_intent() == "install" or (wants_install(user) and not FILE_ASK.search(user)):
+        calls = install_calls()
+        if calls:
+            return calls
     if not is_folder_only(user):
         return []
     dest = folder_path(user)
@@ -886,7 +1074,7 @@ def wants_page(user_text: str) -> bool:
     return bool(FILE_ASK.search(user_text or ""))
 
 
-def run_calls(path: str, lang: str, user_text: str) -> list[dict]:
+def run_calls(path: str, lang: str, user_text: str, source: str = "") -> list[dict]:
     lang = (lang or "").lower()
     quoted = shlex.quote(path)
     if lang in ("html", "htm") or path.endswith((".html", ".htm")):
@@ -894,8 +1082,19 @@ def run_calls(path: str, lang: str, user_text: str) -> list[dict]:
             return [{"name": "bash", "arguments": {"command": f"open {quoted}"}}]
         return []
     if lang in ("python", "py") or path.endswith(".py"):
+        out: list[dict] = []
+        if not source:
+            try:
+                source = open(path, encoding="utf-8").read()
+            except OSError:
+                source = ""
+        pkgs = python_imports(source)
+        if pkgs or wants_install(user_text) or wants_run(user_text):
+            out.extend(install_calls(extra=pkgs, root=os.path.dirname(path) or work_dir()))
         if wants_run(user_text):
-            return [{"name": "bash", "arguments": {"command": f"python3 {quoted}"}}]
+            venv_py = os.path.join(os.path.dirname(path) or work_dir(), ".venv", "bin", "python")
+            out.append(bash_call(f"{shlex.quote(venv_py)} {quoted}"))
+        return out
     return []
 
 
@@ -915,7 +1114,7 @@ def file_calls(source: str) -> list[dict]:
             continue
         seen.add(path)
         found.append({"name": "write", "arguments": {"path": path, "content": body}})
-        found.extend(run_calls(path, lang, user_text))
+        found.extend(run_calls(path, lang, user_text, source=body))
     if found:
         return found
     text = source or ""
@@ -1043,7 +1242,7 @@ def prepare(body: bytes) -> bytes:
         incoming.pop("tools", None)
     elif isinstance(tools, list):
         compact = [tool for item in tools if (tool := compact_tool(item))]
-        if _ctx.intent == "folder":
+        if _ctx.intent in {"folder", "install", "run"}:
             compact = [tool for tool in compact if (tool.get("function") or {}).get("name") in {"bash", "shell"}]
         if compact:
             incoming["tools"] = compact
