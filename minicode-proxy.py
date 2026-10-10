@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Turn coder's plain JSON tool calls into the tool_calls field clients expect."""
+"""Local coding shim in front of the small model.
+
+The 7B model is not trusted to pick tools. This process reads the user turn,
+does obvious filesystem work itself, and only then forwards harder writing
+to the model. Dumped files still become write plus bash.
+"""
 
 from __future__ import annotations
 
@@ -47,6 +52,8 @@ def as_call(obj) -> dict | None:
 
 
 def parse_calls(text: str) -> list[dict]:
+    if is_folder_request(last_user()):
+        return correct_calls([])
     found = []
     for raw in TOOL_BLOCK.findall(text or ""):
         try:
@@ -212,8 +219,14 @@ def rewrite_openai(payload: dict) -> dict:
     message = choices[0].get("message") or {}
     if message.get("tool_calls"):
         ground_tool_calls(message["tool_calls"])
+        calls = correct_calls(calls_from_openai(message["tool_calls"]))
+        if calls:
+            message["tool_calls"] = openai_tool_calls(calls)
+            message["content"] = ""
+            choices[0]["message"] = message
+            choices[0]["finish_reason"] = "tool_calls"
         return payload
-    calls = parse_calls(message.get("content") or "")
+    calls = correct_calls(parse_calls(message.get("content") or ""))
     if not calls:
         return payload
     message["tool_calls"] = openai_tool_calls(calls)
@@ -227,8 +240,13 @@ def rewrite_ollama(payload: dict) -> dict:
     message = payload.get("message") or {}
     if message.get("tool_calls"):
         ground_tool_calls(message["tool_calls"])
+        calls = correct_calls(calls_from_ollama(message["tool_calls"]))
+        if calls:
+            message["tool_calls"] = ollama_tool_calls(calls)
+            message["content"] = ""
+            payload["message"] = message
         return payload
-    calls = parse_calls(message.get("content") or "")
+    calls = correct_calls(parse_calls(message.get("content") or ""))
     if not calls:
         return payload
     message["tool_calls"] = ollama_tool_calls(calls)
@@ -319,10 +337,19 @@ def rewrite_ollama_stream(raw: bytes) -> bytes:
         last = event
         message = event.get("message") or {}
         if message.get("tool_calls"):
+            calls = correct_calls(calls_from_ollama(message["tool_calls"]))
+            if calls and last is not None:
+                last["done"] = True
+                last["message"] = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": ollama_tool_calls(calls),
+                }
+                return json.dumps(last, ensure_ascii=False).encode() + b"\n"
             return ground_bytes(raw)
         if message.get("content"):
             parts.append(message["content"])
-    calls = parse_calls("".join(parts))
+    calls = correct_calls(parse_calls("".join(parts)))
     if not calls or last is None:
         return raw
     last["done"] = True
@@ -356,6 +383,17 @@ class Handler(BaseHTTPRequestHandler):
             incoming = json.loads(body.decode() or "{}") if body else {}
         except json.JSONDecodeError:
             incoming = {}
+        if self.command == "POST" and path.startswith(("/v1/chat/completions", "/api/chat")):
+            forced = short_circuit_calls()
+            if forced:
+                model = incoming.get("model") or "coder"
+                if incoming.get("stream") and path.startswith("/v1/chat/completions"):
+                    self._send(200, "text/event-stream", tool_stream(model, forced))
+                elif path.startswith("/v1/chat/completions"):
+                    self._send(200, "application/json", tool_json(model, forced))
+                else:
+                    self._send(200, "application/json", ollama_tool_json(forced))
+                return
         request = urllib.request.Request(
             current_upstream() + path,
             data=body if self.command == "POST" else None,
@@ -418,9 +456,13 @@ class Handler(BaseHTTPRequestHandler):
                 if text:
                     parts.append(text)
             if native:
+                calls = correct_calls(native_calls_from_sse(bytes(held)))
+                if calls:
+                    self._send(200, "text/event-stream", tool_stream(model, calls))
+                    return
                 self._send(200, "text/event-stream", ground_bytes(bytes(held)))
                 return
-            calls = parse_calls("".join(parts))
+            calls = correct_calls(parse_calls("".join(parts)))
             if calls:
                 self._send(200, "text/event-stream", tool_stream(model, calls))
                 return
@@ -441,7 +483,9 @@ def system_prompt() -> str:
     return (
         "The shell and the files are already on the user's Mac. "
         "Do not say the command ran on another computer, and do not tell the user to copy files with scp. "
+        "You only write and edit files. Folders are created for you. "
         "When the user asks you to create a file, run a command, or open a page, call the tool. "
+        "Never use write to make a folder. write always creates a file and needs a suffix like .html or .py. "
         "Never paste the full file in the chat. Never tell the user to save or copy the code. "
         "Use write with path and content, then bash to run or open the file. "
         f"New files go in the current project {work_dir()}. HTML games can also go on {desktop}. "
@@ -501,6 +545,232 @@ def fence_calls(source: str) -> list[dict]:
 
 def last_user() -> str:
     return getattr(_ctx, "user", "") or ""
+
+
+FOLDER_ASK = re.compile(
+    r"文件夹|目录|(?<![A-Za-z])folders?(?![A-Za-z])|(?<![A-Za-z])directory(?![A-Za-z])|mkdir",
+    re.I,
+)
+FILE_ASK = re.compile(
+    r"文件(?!夹)|html|页面|游戏|代码|脚本|\.html|\.py|\.js|tetris|俄罗斯方块|网页",
+    re.I,
+)
+FOLDER_SKIP = {
+    "html",
+    "file",
+    "文件夹",
+    "目录",
+    "folder",
+    "directory",
+    "mkdir",
+    "一个",
+    "这个",
+    "那个",
+    "新的",
+    "新建",
+    "创建",
+    "然后",
+    "并且",
+    "再",
+}
+NAME_NOISE = re.compile(r"写|页面|html|代码|脚本|游戏|然后|并且")
+
+
+def is_folder_request(text: str) -> bool:
+    return bool(FOLDER_ASK.search(text or ""))
+
+
+def is_folder_only(text: str) -> bool:
+    return is_folder_request(text) and not FILE_ASK.search(text or "")
+
+
+def folder_path(user_text: str) -> str:
+    root = work_dir()
+    patterns = (
+        r"(?:文件夹|目录|folder)\s*(?:叫做|名叫|命名为|名为|叫)?\s*[「『\"'`]?([A-Za-z0-9._\-\u4e00-\u9fff]+)",
+        r"(?:创建|新建|建一个|建个|做一个|开一个)\s*(?:一个)?(?:叫做|名叫|名为|叫)?\s*[「『\"'`]?([A-Za-z0-9._\-\u4e00-\u9fff]+)[」『\"'`]?\s*(?:的)?(?:文件夹|目录|folder)",
+        r"([A-Za-z0-9._\-\u4e00-\u9fff]+)\s*(?:这个)?(?:文件夹|目录|folder)",
+        r"(?:叫做|名叫|命名为|名为|叫)\s*[「『\"'`]?([A-Za-z0-9._\-\u4e00-\u9fff]+)",
+        r"[「『\"'`]([A-Za-z0-9._\-\u4e00-\u9fff]+)[」』\"'`]",
+        r"(?:mkdir\s+-p\s+|mkdir\s+)([~\w./-]+)",
+        r"((?:/Users/[^/\s]+/|~/|Desktop/)[\w./-]+)",
+    )
+    for pat in patterns:
+        for match in re.finditer(pat, user_text or "", re.I):
+            name = match.group(1)
+            if not name or name.lower() in FOLDER_SKIP or NAME_NOISE.search(name) or name.startswith(("新建", "创建", "建个", "建一")):
+                continue
+            if name.startswith("~") or name.startswith("/"):
+                return ground_text(os.path.expanduser(name))
+            return os.path.join(root, name)
+    return ""
+
+
+def mkdir_call(path: str) -> dict:
+    return {"name": "bash", "arguments": {"command": f"mkdir -p {shlex.quote(path)}"}}
+
+
+def short_circuit_calls() -> list[dict]:
+    user = last_user()
+    if not is_folder_only(user):
+        return []
+    dest = folder_path(user)
+    if not dest:
+        return []
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except OSError:
+        pass
+    return [mkdir_call(dest)]
+
+
+def tool_json(model: str, calls: list[dict]) -> bytes:
+    return json.dumps(
+        {
+            "id": "chatcmpl-minicode",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": openai_tool_calls(calls),
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        },
+        ensure_ascii=False,
+    ).encode()
+
+
+def ollama_tool_json(calls: list[dict]) -> bytes:
+    return json.dumps(
+        {
+            "model": "coder",
+            "done": True,
+            "message": {"role": "assistant", "content": "", "tool_calls": ollama_tool_calls(calls)},
+        },
+        ensure_ascii=False,
+    ).encode()
+
+
+def decode_args(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"path": value} if value else {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def calls_from_openai(tool_calls: list) -> list[dict]:
+    out = []
+    for item in tool_calls or []:
+        function = item.get("function") if isinstance(item, dict) else None
+        if not isinstance(function, dict):
+            continue
+        out.append({"name": function.get("name") or "", "arguments": decode_args(function.get("arguments"))})
+    return out
+
+
+def calls_from_ollama(tool_calls: list) -> list[dict]:
+    out = []
+    for item in tool_calls or []:
+        function = item.get("function") if isinstance(item, dict) else None
+        if not isinstance(function, dict):
+            continue
+        out.append({"name": function.get("name") or "", "arguments": decode_args(function.get("arguments"))})
+    return out
+
+
+def native_calls_from_sse(raw: bytes) -> list[dict]:
+    acc: dict[int, dict[str, str]] = {}
+    for line in raw.splitlines():
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == b"[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        choices = event.get("choices") or []
+        items = []
+        if choices:
+            delta = choices[0].get("delta") or {}
+            message = choices[0].get("message") or {}
+            items.extend(delta.get("tool_calls") or [])
+            items.extend(message.get("tool_calls") or [])
+        else:
+            items.extend((event.get("message") or {}).get("tool_calls") or [])
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            index = int(item.get("index") or 0)
+            cur = acc.setdefault(index, {"name": "", "arguments": ""})
+            function = item.get("function") if isinstance(item.get("function"), dict) else {}
+            if function.get("name"):
+                cur["name"] = str(function["name"])
+            if function.get("arguments"):
+                cur["arguments"] += function["arguments"] if isinstance(function["arguments"], str) else json.dumps(function["arguments"])
+    out = []
+    for index in sorted(acc):
+        item = acc[index]
+        out.append({"name": item.get("name") or "", "arguments": decode_args(item.get("arguments"))})
+    return out
+
+
+def correct_calls(calls: list[dict]) -> list[dict]:
+    user = last_user()
+    folder = is_folder_request(user)
+    out: list[dict] = []
+    for call in calls or []:
+        name = str(call.get("name") or "").lower()
+        args = decode_args(call.get("arguments"))
+        path = str(args.get("path") or args.get("filePath") or "")
+        content = args.get("content") if args.get("content") is not None else args.get("contents")
+        content_s = content if isinstance(content, str) else ""
+        if folder and name == "write":
+            dest = path or folder_path(user)
+            if dest:
+                try:
+                    os.makedirs(dest, exist_ok=True)
+                except OSError:
+                    pass
+                out.append(mkdir_call(dest))
+            continue
+        if name == "write" and not content_s.strip() and path and not os.path.splitext(os.path.basename(path))[1]:
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError:
+                pass
+            out.append(mkdir_call(path))
+            continue
+        if name == "write" and path:
+            parent = os.path.dirname(path)
+            if parent and parent not in {HOME, "/", work_dir()}:
+                try:
+                    os.makedirs(parent, exist_ok=True)
+                except OSError:
+                    pass
+                out.append(mkdir_call(parent))
+        out.append(call)
+    if folder and not any(str(item.get("name") or "") == "bash" and "mkdir" in str((item.get("arguments") or {}).get("command") or "") for item in out):
+        dest = folder_path(user)
+        if dest:
+            try:
+                os.makedirs(dest, exist_ok=True)
+            except OSError:
+                pass
+            out.insert(0, mkdir_call(dest))
+    return out
 
 
 def file_path(name: str, lang: str, body: str, user_text: str) -> str:
@@ -683,6 +953,8 @@ def prepare(body: bytes) -> bytes:
     tools = incoming.get("tools")
     if isinstance(tools, list):
         compact = [tool for item in tools if (tool := compact_tool(item))]
+        if is_folder_only(user_text):
+            compact = [tool for tool in compact if (tool.get("function") or {}).get("name") in {"bash", "shell"}]
         if compact:
             incoming["tools"] = compact
         else:
