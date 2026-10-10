@@ -62,9 +62,9 @@ choose_model() {
     NUM_CTX=8192
     REASON="内存不到 12GB。7B 会把系统挤进交换区，所以用 3B。"
   elif [ "$mem_gb" -lt 24 ]; then
-    MODEL_TAG=qwen2.5-coder:7b
+    MODEL_TAG=qwen3.5:9b
     NUM_CTX=16384
-    REASON="12–23GB 放得下 7B Q4，并留出系统和 16384 上下文。"
+    REASON="12–23GB 放得下 9B Q4（约 6GB），并留出系统和 16384 上下文。它会自己调用工具。"
   elif [ "$mem_gb" -lt 48 ]; then
     MODEL_TAG=qwen2.5-coder:14b
     NUM_CTX=8192
@@ -144,14 +144,22 @@ deploy_model() {
   wait_ollama
   ollama pull "$MODEL_TAG"
   mkdir -p "$HOME/llm"
-  cat > "$HOME/llm/Modelfile" << EOF
+  case $MODEL_TAG in
+    qwen2.5-coder:*)
+      cat > "$HOME/llm/Modelfile" << EOF
 FROM $MODEL_TAG
 PARAMETER num_ctx $NUM_CTX
 PARAMETER temperature 0.2
 PARAMETER top_p 0.9
 PARAMETER repeat_penalty 1.05
 EOF
+      ;;
+    *)
+      printf 'FROM %s\nPARAMETER num_ctx %s\n' "$MODEL_TAG" "$NUM_CTX" > "$HOME/llm/Modelfile"
+      ;;
+  esac
   ollama create coder -f "$HOME/llm/Modelfile"
+  ollama stop coder >/dev/null 2>&1 || true
   echo "模型 coder 已就绪（来自 ${MODEL_TAG}）。"
 }
 
@@ -319,10 +327,36 @@ stash_client_files() {
   done
 }
 
+detect_native() {
+  python3 - "$HOME/.config/minicode/upstream" "$HOME/.config/minicode/native" << 'PY'
+import json, os, sys, urllib.request
+upstream_file, flag = sys.argv[1], sys.argv[2]
+try:
+    base = open(upstream_file, encoding="utf-8").read().strip()
+except OSError:
+    base = ""
+base = (base or "http://127.0.0.1:11434").rstrip("/")
+req = urllib.request.Request(base + "/api/show", data=json.dumps({"model": "coder"}).encode(),
+                             headers={"Content-Type": "application/json", "User-Agent": "minicode"})
+try:
+    with urllib.request.urlopen(req, timeout=6) as resp:
+        info = json.loads(resp.read())
+except Exception:
+    sys.exit(0)
+arch = str((info.get("model_info") or {}).get("general.architecture") or (info.get("details") or {}).get("family") or "")
+if arch in ("qwen2", "llama"):
+    if os.path.exists(flag):
+        os.remove(flag)
+else:
+    open(flag, "a").close()
+PY
+}
+
 apply_client() {
   stash_client_files
   install_opencode
   install_launcher
+  detect_native
   if [ -f "$ROOT/minicode-proxy.py" ]; then
     if ! cmp -s "$ROOT/minicode-proxy.py" "$HOME/.config/minicode/proxy.py" 2>/dev/null; then
       cp "$ROOT/minicode-proxy.py" "$HOME/.config/minicode/proxy.py"
@@ -373,6 +407,7 @@ install_tools() {
     install_proxy "$upstream"
   fi
   install_launcher
+  detect_native
   echo "工具已接上。进入项目目录后运行: minicode"
 }
 

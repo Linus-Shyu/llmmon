@@ -67,20 +67,20 @@ minicode --pick             # 从最近用过的目录和桌面上的文件夹�
 
 ![minicode](docs/minicode.png)
 
-入门款 Apple 芯片上，7B 四比特大约每秒 20 个 token。适合改一个文件或跑一条命令。任务铺开到整个大仓库时，它经常改错。
+16GB 的 Apple 芯片上，`qwen3.5:9b` 建文件、写文件、装依赖、跑代码、改代码，每一步十几到三十几秒。适合一个小项目。任务铺开到整个大仓库时，它还是会改错。
 
 ## 模型怎么选
 
-`setup-coder` 读这台 Mac 的统一内存，用 Ollama 装一个放得下的 Qwen2.5-Coder，对外的名字是 `coder`。
+`setup-coder` 读这台 Mac 的统一内存，用 Ollama 装一个放得下的模型，对外的名字是 `coder`。
 
 | 内存 | 模型 | 上下文 |
 | --- | --- | --- |
 | 不到 12GB | Qwen2.5-Coder 3B | 8192 |
-| 12–23GB | Qwen2.5-Coder 7B | 16384 |
+| 12–23GB | Qwen3.5 9B | 16384 |
 | 24–47GB | Qwen2.5-Coder 14B | 8192 |
 | 48GB 及以上 | Qwen2.5-Coder 32B | 16384 |
 
-12–23GB 的机器用 7B。这个大小放得下，还留得下系统和 16384 的上下文。在这台机器上装 14B 或 32B 会被推进交换分区。
+12–23GB 的机器用 Qwen3.5 9B。它约 6GB，留得下系统和 16384 的上下文，而且会自己调用写文件和跑命令的工具。同档的 Qwen2.5-Coder 7B 常把工具调用当文字吐出来，同样三件事一件也做不成。
 
 写给 OpenCode 的配置不加载已安装的技能、网页搜索和子代理。7B 模型读这些说明就要花掉几千 token，每一轮还没写代码就先把时间耗在读说明上。新开会话用短提示。已经开着的会话要退出再开，才会换上新提示。`setup-coder --apply` 会改已有的 `~/.config/opencode/opencode.json`：打开写文件和跑命令、加长输出、换上短提示。其它自定义项会留下。
 
@@ -100,7 +100,7 @@ OpenCode 本体不改。安装的是 Homebrew 里的 `anomalyco/tap/opencode-v2`
 
 看画面的那台 Mac 优先读 `~/.config/llmmon/url` 和 `~/.config/llmmon/token`，用 HTTPS 拉 `/snapshot`。没有这个地址时，才用 `~/.config/llmmon/host` 里的 `user@host` 走 SSH。环境变量 `LLMMON_URL`、`LLMMON_TOKEN`、`LLMMON_HOST` 可以盖过文件。再加一台机器写在 `~/.config/llmmon/peers`，每行 `标签 user@host`，画面底部会多一条状态带。
 
-`qwen2.5-coder:7b` 常把工具调用当文字吐出来，所以代理替它决定工具。换成会自己调工具的模型（例如 `qwen3.5:9b`）时，建一个空文件 `~/.config/minicode/native`：代理每一轮都把工具交给模型，关掉思考，保留更长的对话。
+每次启动 `minicode` 都会问模型那台 `coder` 是什么架构。是 Qwen2.5 这类不会调工具的，代理替它决定工具。是会自己调工具的（例如 `qwen3.5:9b`），就建 `~/.config/minicode/native`：代理每一轮都把工具交给模型，关掉思考，保留更长的对话。
 
 模型地址写在 `~/.config/minicode/upstream`。代理先读这个文件，文件没有时才用启动项里的 `MINICODE_UPSTREAM`。
 
